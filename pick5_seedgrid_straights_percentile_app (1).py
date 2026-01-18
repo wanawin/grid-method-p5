@@ -1587,6 +1587,7 @@ def _read_csv_df_if_exists(paths: List[str]) -> Optional[pd.DataFrame]:
 DEFAULT_LOSER_CANDIDATES = [
     "loserlist_filters15_FIXED (5).csv",
     "loserlist_filters15_FIXED.csv",
+    "loserlist_filters15_FIXED (5).csv",
     "loserlist_filters15_FIXED.txt",
     "loserlist_filters15.txt",
 ]
@@ -1758,6 +1759,21 @@ st.caption(f"Manual pool size (current): {len(manual_pool)}")
 
 filters_by_id = {f.fid: f for f in filters_all}
 
+# Ensure ranked_filters exists for the manual 1-by-1 section
+ranked_filters = st.session_state.get("ranked_filters_cache")
+if ranked_filters is None:
+    with st.spinner("Ranking filters (walk-forward)..."):
+        ranked_filters = rank_filters_walkforward(
+            df_mr=df,
+            filters=filters_all,
+            cal=cal,
+            gen_mode=gen_mode,
+            gen_cap=int(gen_cap),
+            target_after_bins=max(int(target_final) * 4, 450),
+            safety_keep_rate=float(safety_keep_rate),
+        )
+    st.session_state["ranked_filters_cache"] = ranked_filters
+
 if len(ranked_filters) == 0:
     st.info("No ranked filters available (none loaded or none applicable).")
 else:
@@ -1829,16 +1845,26 @@ if lookup_box is not None:
     st.write({"lookup box still in manual pool": lookup_box in set(st.session_state.get("manual_pool", []))})
 
 st.subheader("Dynamic filter ranking (walk-forward)")
-with st.spinner("Ranking filters on this history (walk-forward)..."):
-    ranked_filters = rank_filters_walkforward(
-        df_mr=df,
-        filters=filters_all,
-        cal=cal,
-        gen_mode=gen_mode,
-        gen_cap=int(gen_cap),
-        target_after_bins=max(int(target_final) * 4, 450),
-        safety_keep_rate=float(safety_keep_rate),
-    )
+
+# Cache the ranking so we don't re-run it on every Streamlit re-render.
+col_r1, col_r2 = st.columns([1, 3])
+with col_r1:
+    if st.button("Re-run filter ranking", key="rerank_filters_btn"):
+        st.session_state.pop("ranked_filters_cache", None)
+
+ranked_filters = st.session_state.get("ranked_filters_cache")
+if ranked_filters is None:
+    with st.spinner("Ranking filters on this history (walk-forward)..."):
+        ranked_filters = rank_filters_walkforward(
+            df_mr=df,
+            filters=filters_all,
+            cal=cal,
+            gen_mode=gen_mode,
+            gen_cap=int(gen_cap),
+            target_after_bins=max(int(target_final) * 4, 450),
+            safety_keep_rate=float(safety_keep_rate),
+        )
+    st.session_state["ranked_filters_cache"] = ranked_filters
 
 df_perf = pd.DataFrame([
     {
