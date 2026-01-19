@@ -1,5 +1,6 @@
+from __future__ import annotations
+
 import io
-import pathlib
 import re
 import math
 from dataclasses import dataclass
@@ -1014,24 +1015,28 @@ def sanitize_expr(expr: str) -> str:
     s = re.sub(r"(\d)(and|or|not|in|is)\b", r"\1 \2", s)
     return s
 
+def safe_eval(expr: str, env: Dict, *, filt: Dict | None = None, tracker: FailureTracker | None = None) -> bool:
+    """Evaluate boolean expression with a restricted global namespace.
 
-_COMPILED_EXPR_CACHE = {}  # expr string -> compiled code
-
-
-def safe_eval(expr: str, env: dict) -> bool:
-    """Safely evaluate a boolean expression with a tiny compiled-expression cache.
-
-    NOTE: This is *still* using eval, but with __builtins__ removed and compilation cached
-    to dramatically speed up large ranking runs.
+    Fail-safe behavior: any exception returns False (so the filter does NOT eliminate),
+    but we *record* the failure so it can be fixed.
     """
     try:
-        code = _COMPILED_EXPR_CACHE.get(expr)
-        if code is None:
-            code = compile(expr, '<filter_expr>', 'eval')
-            _COMPILED_EXPR_CACHE[expr] = code
-        return bool(eval(code, {"__builtins__": {}}, env))
-    except Exception:
+        expr = sanitize_expr(expr)
+        return bool(eval(expr, {"__builtins__": {}}, env))
+    except Exception as e:
+        if tracker is not None and filt is not None:
+            try:
+                tracker.add(
+                    fid=str(filt.get("id", "")),
+                    name=str(filt.get("name", "")),
+                    expression=str(expr),
+                    err=e,
+                )
+            except Exception:
+                pass
         return False
+
 
 def build_filter_env(seed: str, prev: str, prev2: str, combo_box: str, extra_ctx: Optional[Dict] = None) -> Dict:
     seed_digits = [int(d) for d in seed]
@@ -1296,158 +1301,153 @@ class FilterPerf:
     avg_elim_rate: float
 
 
-
 def rank_filters_walkforward(
     df_mr: pd.DataFrame,
-    filters: list[FilterDef],
-    cal: Calibration,
+    filters: List[FilterDef],
+    cal: CalibrationResult,
     gen_mode: str,
     gen_cap: int,
     target_after_bins: int,
-    safety_keep_rate: float,
-    sample_size: int = 80,
-    max_filters: int | None = None,
-    max_seconds: int = 90,
-) -> list[FilterPerf]:
-    """Rank filters using walk-forward winner retention, but fast.
+    safety_keep_rate: float = 0.75,
+) -> List[FilterPerf]:
+    """Score each filter on recent walk-forward: keep-rate of winners and elim-rate on pools."""
+    transitions = build_transitions(df_mr)
+    n_trans = len(transitions)
 
-    Key speedups vs the old version:
-    - Winner retention is computed by evaluating filters ONLY on the real next-winner.
-    - Elimination rate is estimated via a sample of the candidate pool (sample_size), not the full pool.
-    - Expressions/applicable_if strings are still resolved per-transition, but we compile-cache eval.
-    """
-    import random, time
+    vw = cal.validation_window
+    lw = cal.learning_window
 
-    t0 = time.time()
-    rng = random.Random(1337)
+    val_start = n_trans - vw
+    learn_start = max(0, val_start - lw)
+    learn_trans = transitions[learn_start:val_start]
+    val_trans = transitions[val_start:]
 
-    # Walk-forward transitions are in MR order: seed = df[i], winner = df[i-1]
-    transitions = []  # (seed, winner, pool_boxes, ll_ctx)
-    n = len(df_mr)
+    recent_draws = df_mr.iloc[:20]["result"].tolist()
+    tend = learn_tendencies_from_transitions(learn_trans, recent_draws)
 
-    learn = max(0, min(cal.learn, n - 2))
-    validate = max(0, min(cal.validate, n - 2 - learn))
-    total = learn + validate
-    if total <= 0:
-        return []
+    # Precompute pools per validation seed
+    pools = []
+    ctxs = []
+    winners = []
 
-    # Build transitions
-    for idx in range(1, total + 1):
-        seed = str(df_mr.iloc[idx]["result"]).zfill(5)
-        winner = str(df_mr.iloc[idx - 1]["result"]).zfill(5)
+    # Need loserlist context uses last13 MR->Oldest relative to each seed
+    # We'll build MR-anchored slices by finding seed in df chron.
+    # Simplification: use overall MR slices around the seed when possible.
 
-        # pool generation + ranking + percentile keep (same logic as main run)
-        boxes = generate_candidate_boxes(seed, mode=gen_mode, cap=int(gen_cap))
-        ranked = rank_candidates(boxes, seed, cal.tend)
-        ranked = ranked[: cal.topN]
-        ranked_bins = apply_percentile_bins(ranked, cal.bins, bin_size=cal.bin_size)
-        pool = [b for b, _ in ranked_bins]
-        pool = pool[: max(int(target_after_bins), 1)]
+    # Build chronological list for locating
+    chron = list(reversed(df_mr["result"].tolist()))
+    idx_map = {r: i for i, r in enumerate(chron)}  # last occurrence; ok for typical use
 
-        # build LL ctx for this seed window (cheap)
-        sub13 = df_mr.iloc[idx: idx + 13]["result"].tolist()
-        sub20 = df_mr.iloc[idx: idx + 20]["result"].tolist()
+    for seed, winner in val_trans:
+        boxes = generate_candidate_boxes(seed, mode=gen_mode, cap=gen_cap)
+        ranked_scored = rank_candidates(boxes, seed, tend)[:cal.topN]
+        ranked_scored = apply_percentile_bins(ranked_scored, cal.bins, bin_size=cal.bin_size)
+        ranked_scored = ranked_scored[:target_after_bins]
+        pool = [b for b, _ in ranked_scored]
+        pools.append(pool)
+        winners.append(winner)
+
+        # prev/prev2 for env: use seed's previous draws chronologically
+        i = idx_map.get(seed)
+        if i is None or i < 2:
+            prev = seed
+            prev2 = seed
+            last13 = [seed] * 13
+            last20 = [seed] * 20
+        else:
+            prev = chron[i - 1]
+            prev2 = chron[i - 2]
+            # last13 MR->Oldest relative to "seed" as MR
+            slice_rev = list(reversed(chron[max(0, i - 12): i + 1]))
+            last13 = slice_rev + [slice_rev[-1]] * (13 - len(slice_rev))
+            slice20 = list(reversed(chron[max(0, i - 19): i + 1]))
+            last20 = slice20 + [slice20[-1]] * (20 - len(slice20))
+
+        ll_ctx = None
         try:
-            ll = loser_list_ctx(sub13, sub20)
+            ll_ctx = loser_list_ctx(last13, last20)
         except Exception:
-            ll = None
+            ll_ctx = None
+        ctxs.append((seed, prev, prev2, ll_ctx))
 
-        transitions.append((seed, winner, pool, ll))
+    perfs = []
 
-    # Evaluate filters
-    perfs: list[FilterPerf] = []
-
-    # optionally cap number of filters evaluated (for quick runs)
-    filters_iter = filters
-    if max_filters is not None:
-        filters_iter = filters_iter[: max(0, int(max_filters))]
-
-    for f in filters_iter:
-        if (time.time() - t0) > max_seconds:
-            break
-
-        kept = 0
-        applied = 0
+    for f in filters:
+        applies = 0
+        winner_kept = 0
         elim_rates = []
 
-        for seed, winner, pool, ll in transitions:
-            # Winner check (retention)
-            w_env = make_env(seed, winner, ll)
-
-            app_if = (f.applicable_if or '').strip()
-            if app_if:
-                try:
-                    app_ok = safe_eval(resolve_expr(app_if, w_env), w_env)
-                except Exception:
-                    app_ok = False
-            else:
-                app_ok = True
-
-            if not app_ok:
-                # not applicable -> treated as kept and not counted in applied
-                kept += 1
+        for pool, (seed, prev, prev2, ll_ctx), winner in zip(pools, ctxs, winners):
+            if not pool:
+                continue
+            if f.source == "loserlist" and ll_ctx is None:
                 continue
 
-            applied += 1
+            # resolve expr for this run
+            app_if = f.applicable_if or "True"
+            expr = f.expression or "False"
+            if f.source == "loserlist":
+                app_if = resolve_loserlist_expression(app_if, ll_ctx)
+                expr = resolve_loserlist_expression(expr, ll_ctx)
 
-            # If filter returns True => eliminate
-            try:
-                elim_w = safe_eval(resolve_expr(f.expression, w_env), w_env)
-            except Exception:
-                elim_w = False
+            # apply filter once on the pool
+            before = len(pool)
+            kept = []
+            eliminated = 0
+            wbox = "".join(sorted(winner))
+            w_in_before = wbox in pool
+            w_in_after = False
 
-            if not elim_w:
-                kept += 1
+            for box in pool:
+                env = build_filter_env(seed, prev, prev2, box, extra_ctx=(ll_ctx or {}))
+                if not safe_eval(app_if, env):
+                    kept.append(box)
+                    continue
+                applies += 1
+                if safe_eval(expr, env):
+                    eliminated += 1
+                else:
+                    kept.append(box)
 
-            # Estimate elim rate using a sample of pool
-            if pool:
-                k = min(int(sample_size), len(pool))
-                sample = pool if k == len(pool) else rng.sample(pool, k)
+            after = len(kept)
+            if before > 0:
+                elim_rates.append(eliminated / before)
 
-                elim_ct = 0
-                seen_ct = 0
-                for box in sample:
-                    env = make_env(seed, box, ll)
+            if w_in_before:
+                if wbox in kept:
+                    w_in_after = True
+                    winner_kept += 1
+                else:
+                    winner_kept += 0
 
-                    if app_if:
-                        try:
-                            ok = safe_eval(resolve_expr(app_if, env), env)
-                        except Exception:
-                            ok = False
-                        if not ok:
-                            continue
+        # keep_rate measured only on cases where winner was present pre-filter in pool
+        # approximate by dividing by count of validation draws with winner in pool
+        denom = 0
+        for pool, (_, _, _, _), winner in zip(pools, ctxs, winners):
+            if "".join(sorted(winner)) in pool:
+                denom += 1
+        keep_rate = (winner_kept / denom) if denom else 1.0
+        avg_elim = float(sum(elim_rates) / len(elim_rates)) if elim_rates else 0.0
 
-                    seen_ct += 1
-                    try:
-                        if safe_eval(resolve_expr(f.expression, env), env):
-                            elim_ct += 1
-                    except Exception:
-                        continue
+        perfs.append(FilterPerf(
+            fid=f.fid,
+            name=f.name,
+            source=f.source,
+            apply_count=applies,
+            keep_rate=float(keep_rate),
+            avg_elim_rate=float(avg_elim),
+        ))
 
-                if seen_ct:
-                    elim_rates.append(elim_ct / seen_ct)
+    # Rank: safest first, then more aggressive
+    safe = [p for p in perfs if p.keep_rate >= safety_keep_rate]
+    safe.sort(key=lambda p: (-p.keep_rate, -p.avg_elim_rate, p.fid))
+    return safe
 
-        if total == 0:
-            continue
 
-        keep_rate = kept / total
-        avg_elim = (sum(elim_rates) / len(elim_rates)) if elim_rates else 0.0
+# -------------------------
+# Straight ordering
+# -------------------------
 
-        if keep_rate >= float(safety_keep_rate):
-            perfs.append(
-                FilterPerf(
-                    fid=f.fid,
-                    name=f.name,
-                    keep_rate=keep_rate,
-                    avg_elim_rate=avg_elim,
-                    apply_count=applied,
-                    source=f.source,
-                )
-            )
-
-    # Sort: highest keep rate first, then higher elimination
-    perfs.sort(key=lambda p: (-p.keep_rate, -p.avg_elim_rate, -p.apply_count, p.fid))
-    return perfs
 
 def straight_rankings_from_box(box: str, tend: LearnedTendencies, seed: str) -> List[str]:
     """Return a ranked list of straight permutations from a box.
@@ -1563,86 +1563,37 @@ with colC:
     st.write({k: "".join(str(x) for x in v) for k, v in g.items()})
 
 
-
 # Load filters (prefer sidebar uploads; fall back to bundled files if present)
-# - This avoids hardcoded /mnt/data paths that do NOT exist on Streamlit Cloud.
-# - It also makes the repo work out-of-the-box if the CSVs are committed.
+filters_all: List[FilterDef] = []
 
-def _read_text_if_exists(paths):
-    for pp in paths:
-        try:
-            pth = pathlib.Path(pp)
-            if pth.is_file():
-                return pth.read_text(encoding='utf-8')
-        except Exception:
-            pass
-    return None
+if use_loser:
+    try:
+        if loserlist_uploader is not None:
+            loser_text = loserlist_uploader.read().decode("utf-8", errors="ignore")
+        else:
+            with open("/mnt/data/loserlist filters15.txt", "r", encoding="utf-8") as f:
+                loser_text = f.read()
+        loser_filters = load_filter_csv_text(loser_text, source="loserlist")
+        filters_all.extend(loser_filters)
+    except Exception as e:
+        st.warning(f"Could not load LoserList filters: {e}")
 
-filters_all = []
+if use_batch10:
+    try:
+        if batch10_uploader is not None:
+            batch_df = pd.read_csv(batch10_uploader, dtype=str).fillna("")
+        else:
+            batch_df = pd.read_csv("/mnt/data/lottery_filters_batch10 (61).csv", dtype=str).fillna("")
+        # take only first 780 data rows
+        batch_df = batch_df.iloc[:780].copy()
+        buff = io.StringIO()
+        batch_df.to_csv(buff, index=False)
+        batch_filters = load_filter_csv_text(buff.getvalue(), source="batch10")
+        filters_all.extend(batch_filters)
+    except Exception as e:
+        st.warning(f"Could not load Batch10 filters: {e}")
 
-# --- LoserList filters ---
-loser_text = None
-if include_loser:
-    if loserlist_upload is not None:
-        try:
-            loser_text = loserlist_upload.getvalue().decode('utf-8', errors='replace')
-        except Exception as e:
-            st.warning(f"Could not read uploaded LoserList filters: {e}")
-            loser_text = None
-    else:
-        # Try common filenames in repo
-        loser_text = _read_text_if_exists([
-            'loserlist_filters15_FIXED.csv',
-            'loserlist_filters15_FIXED (5).csv',
-            'loserlist_filters15_FIXED(5).csv',
-            'loserlist_filters15.csv',
-            'loserlist_filters15.txt',
-        ])
-
-    if loser_text:
-        try:
-            df_ll = pd.read_csv(io.StringIO(loser_text))
-            # tag source
-            for f in df_to_filters(df_ll, source='loserlist'):
-                filters_all.append(f)
-        except Exception as e:
-            st.warning(f"Could not load LoserList filters: {e}")
-
-# --- Batch10 filters ---
-batch_text = None
-if include_batch10:
-    if batch10_upload is not None:
-        try:
-            batch_text = batch10_upload.getvalue().decode('utf-8', errors='replace')
-        except Exception as e:
-            st.warning(f"Could not read uploaded Batch10 filters: {e}")
-            batch_text = None
-    else:
-        batch_text = _read_text_if_exists([
-            'lottery_filters_batch10_NO_LOSERLIST.csv',
-            'lottery_filters_batch10.csv',
-            'lottery_filters_batch10_NO_LOSERLIST (1).csv',
-        ])
-
-    if batch_text:
-        try:
-            df_b10 = pd.read_csv(io.StringIO(batch_text))
-            for f in df_to_filters(df_b10, source='batch10'):
-                filters_all.append(f)
-        except Exception as e:
-            st.warning(f"Could not load Batch10 filters: {e}")
-
-# Dedupe by ID (prefer first occurrence)
-_seen = set()
-filters_dedup = []
-for f in filters_all:
-    fid = (f.id or '').strip() or (f.name or '').strip()
-    if fid in _seen:
-        continue
-    _seen.add(fid)
-    filters_dedup.append(f)
-filters_all = filters_dedup
-
+filters_all = dedupe_filters(filters_all)
 st.caption(f"Filters loaded (after dedupe): {len(filters_all)}")
 
 
@@ -1724,40 +1675,22 @@ except Exception:
     ll_ctx = None
 
 
-
 st.subheader("Dynamic filter ranking (walk-forward)")
+# Ensure these exist even if ranking fails/short-circuits
+ranked_filters = []
+df_perf = pd.DataFrame()
+to_apply_ids = set()
 
-# Fast ranking controls
-c1, c2, c3 = st.columns([1, 1, 1])
-with c1:
-    sample_size = st.number_input("Ranking sample size (boxes per transition)", min_value=10, max_value=400, value=80, step=10)
-with c2:
-    max_filters = st.number_input("Max filters to rank (0 = all)", min_value=0, max_value=2000, value=0, step=50)
-with c3:
-    max_seconds = st.number_input("Max seconds per rank run", min_value=15, max_value=600, value=90, step=15)
-
-if "ranked_filters" not in st.session_state:
-    st.session_state["ranked_filters"] = []
-
-run_rank = st.button("Run / Refresh filter ranking", type="primary")
-
-if run_rank:
-    with st.spinner("Ranking filters (walk-forward, fast)..."):
-        ranked_filters = rank_filters_walkforward(
-            df_mr=df,
-            filters=filters_all,
-            cal=cal,
-            gen_mode=gen_mode,
-            gen_cap=int(gen_cap),
-            target_after_bins=max(int(target_final) * 4, 450),
-            safety_keep_rate=float(safety_keep_rate),
-            sample_size=int(sample_size),
-            max_filters=(None if int(max_filters) == 0 else int(max_filters)),
-            max_seconds=int(max_seconds),
-        )
-        st.session_state["ranked_filters"] = ranked_filters
-
-ranked_filters = st.session_state.get("ranked_filters", [])
+with st.spinner("Ranking filters on this history (walk-forward)..."):
+    ranked_filters = rank_filters_walkforward(
+        df_mr=df,
+        filters=filters_all,
+        cal=cal,
+        gen_mode=gen_mode,
+        gen_cap=int(gen_cap),
+        target_after_bins=max(int(target_final) * 4, 450),
+        safety_keep_rate=float(safety_keep_rate),
+    )
 
 records = [
     {
@@ -1774,26 +1707,33 @@ records = [
 df_perf = pd.DataFrame.from_records(records)
 if df_perf.empty:
     df_perf = pd.DataFrame(columns=["id", "name", "source", "winner_keep_rate", "avg_elim_rate", "apply_count"])
-    st.info("No ranking computed yet. Click **Run / Refresh filter ranking**.")
 
 st.dataframe(df_perf.head(50), use_container_width=True)
 st.caption("Auto-apply order = safest → more aggressive (among those meeting keep-rate threshold)")
 
 
-
 st.subheader("Apply filters automatically to reach target")
 
-if len(ranked_filters) == 0:
-    apply_count = 0
-else:
-    apply_count = st.slider("Max filters to auto-apply", 0, min(100, len(ranked_filters)), min(25, len(ranked_filters)))
+# Defaults so the UI never NameErrors if ranking isn't available
+apply_count = 0
+id_col = None
+to_apply_ids: set[str] = set()
 
-    # Robustly pick the ID column (some runs may produce an empty df without columns)
+if len(ranked_filters) == 0 or df_perf is None or (hasattr(df_perf, 'empty') and df_perf.empty):
+    st.info("No ranked filters available yet (or ranking returned empty).")
+else:
+    apply_count = st.slider(
+        "Max filters to auto-apply",
+        0,
+        min(100, len(ranked_filters)),
+        min(25, len(ranked_filters)),
+    )
+
+    # Robustly pick the ID column
     id_col = 'id' if 'id' in df_perf.columns else ('filter_id' if 'filter_id' in df_perf.columns else None)
-    if id_col is None:
-        to_apply_ids = set()
-    else:
+    if id_col is not None and apply_count > 0:
         to_apply_ids = set(df_perf.head(apply_count)[id_col].astype(str).tolist())
+
 filters_to_apply = [f for f in filters_all if f.fid in to_apply_ids]
 
 # Preserve the ranked order from df_perf
