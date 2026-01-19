@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import io
 import pathlib
 import re
@@ -1020,27 +1018,21 @@ def sanitize_expr(expr: str) -> str:
 _COMPILED_EXPR_CACHE = {}  # expr string -> compiled code
 
 
-def safe_eval(expr: str, env: dict, *, filt: "FilterDef" | None = None, tracker: "FailureTracker" | None = None) -> bool:
-    """Safely evaluate a boolean expression.
+def safe_eval(expr: str, env: dict) -> bool:
+    """Safely evaluate a boolean expression with a tiny compiled-expression cache.
 
-    - Uses a tiny compiled-expression cache for speed.
-    - Keeps the failsafe ON: on any exception, returns False.
-    - If a FailureTracker is provided, it records the failure so you can fix the filter.
+    NOTE: This is *still* using eval, but with __builtins__ removed and compilation cached
+    to dramatically speed up large ranking runs.
     """
-    expr = sanitize_expr(expr)
     try:
         code = _COMPILED_EXPR_CACHE.get(expr)
         if code is None:
             code = compile(expr, '<filter_expr>', 'eval')
             _COMPILED_EXPR_CACHE[expr] = code
         return bool(eval(code, {"__builtins__": {}}, env))
-    except Exception as e:
-        if tracker is not None and filt is not None:
-            try:
-                tracker.add(fid=filt.fid, name=filt.name, expression=expr, err=e)
-            except Exception:
-                pass
+    except Exception:
         return False
+
 def build_filter_env(seed: str, prev: str, prev2: str, combo_box: str, extra_ctx: Optional[Dict] = None) -> Dict:
     seed_digits = [int(d) for d in seed]
     prev_digits = [int(d) for d in prev]
@@ -1305,67 +1297,6 @@ class FilterPerf:
 
 
 
-
-
-# -------------------------
-# Filter expression helpers (fast ranking)
-# -------------------------
-
-
-def resolve_expr(expr: str, env: dict, *, source: str = 'batch10') -> str:
-    """Resolve/normalize an expression for evaluation.
-
-    - Normalizes unicode operators (≤/≥), smart quotes, etc.
-    - Strips stray tokens like '0PWK' that sometimes leak into expressions.
-    - For LoserList expressions, expands list variables into int-safe sets using the
-      LoserList resolver with the current LL context (env['ll_ctx']).
-    """
-    if not expr:
-        return 'False'
-    x = normalize_expr(expr)
-    x = sanitize_expr(x)
-    if source == 'loserlist':
-        try:
-            ll_ctx = env.get('ll_ctx') or {}
-            return resolve_loserlist_expression(x, ll_ctx)
-        except Exception:
-            return x
-    return x
-
-
-
-def make_env(seed: str, combo_or_winner: str, ll_ctx: dict | None = None) -> dict:
-    """Build the eval environment for a given seed and combo.
-
-    Notes:
-    - Filters in this app are treated as BOX-based.
-      So we convert any 5-digit string into its sorted (box) form.
-    - If ll_ctx exists, we extract prev/prev2 from it so due/hot/cold logic matches.
-    - We also attach ll_ctx onto the env so resolve_expr() can expand LoserList lists.
-    """
-    s = str(seed).zfill(5)
-    digits = [d for d in str(combo_or_winner) if d.isdigit()]
-    combo = ''.join(sorted(digits)) if len(digits) == 5 else str(combo_or_winner)
-
-    if ll_ctx is not None:
-        try:
-            prev = ''.join(ll_ctx.get('prev_digits', [])) or s
-        except Exception:
-            prev = s
-        try:
-            prev2 = ''.join(ll_ctx.get('prev2_digits', [])) or prev
-        except Exception:
-            prev2 = prev
-        extra = ll_ctx
-    else:
-        prev = s
-        prev2 = s
-        extra = {}
-
-    env = build_filter_env(s, prev, prev2, combo, extra_ctx=extra)
-    env['ll_ctx'] = ll_ctx or {}
-    return env
-
 def rank_filters_walkforward(
     df_mr: pd.DataFrame,
     filters: list[FilterDef],
@@ -1394,28 +1325,12 @@ def rank_filters_walkforward(
     transitions = []  # (seed, winner, pool_boxes, ll_ctx)
     n = len(df_mr)
 
-    learn = max(0, min(cal.learning_window, n - 2))
-    validate = max(0, min(cal.validation_window, n - 2 - learn))
+    learn = max(0, min(cal.learn, n - 2))
+    validate = max(0, min(cal.validate, n - 2 - learn))
     total = learn + validate
     if total <= 0:
         return []
 
-
-
-    # Tendencies used for ranking candidates (same approach as main run)
-    try:
-        trans_all = build_transitions(df_mr)
-        n_trans = len(trans_all)
-        vw = int(cal.validation_window)
-        lw = int(cal.learning_window)
-        val_start = n_trans - vw
-        learn_start = max(0, val_start - lw)
-        learn_trans = trans_all[learn_start:val_start]
-        recent_draws = df_mr.iloc[:20]["result"].tolist()
-        tend = learn_tendencies_from_transitions(learn_trans, recent_draws)
-    except Exception:
-        # extremely defensive fallback
-        tend = learn_tendencies_from_transitions([], df_mr.iloc[:20]["result"].tolist() if len(df_mr) else [])
     # Build transitions
     for idx in range(1, total + 1):
         seed = str(df_mr.iloc[idx]["result"]).zfill(5)
@@ -1423,7 +1338,7 @@ def rank_filters_walkforward(
 
         # pool generation + ranking + percentile keep (same logic as main run)
         boxes = generate_candidate_boxes(seed, mode=gen_mode, cap=int(gen_cap))
-        ranked = rank_candidates(boxes, seed, tend)
+        ranked = rank_candidates(boxes, seed, cal.tend)
         ranked = ranked[: cal.topN]
         ranked_bins = apply_percentile_bins(ranked, cal.bins, bin_size=cal.bin_size)
         pool = [b for b, _ in ranked_bins]
@@ -1462,7 +1377,7 @@ def rank_filters_walkforward(
             app_if = (f.applicable_if or '').strip()
             if app_if:
                 try:
-                    app_ok = safe_eval(resolve_expr(app_if, w_env, source=f.source), w_env)
+                    app_ok = safe_eval(resolve_expr(app_if, w_env), w_env)
                 except Exception:
                     app_ok = False
             else:
@@ -1477,7 +1392,7 @@ def rank_filters_walkforward(
 
             # If filter returns True => eliminate
             try:
-                elim_w = safe_eval(resolve_expr(f.expression, w_env, source=f.source), w_env)
+                elim_w = safe_eval(resolve_expr(f.expression, w_env), w_env)
             except Exception:
                 elim_w = False
 
@@ -1496,7 +1411,7 @@ def rank_filters_walkforward(
 
                     if app_if:
                         try:
-                            ok = safe_eval(resolve_expr(app_if, env, source=f.source), env)
+                            ok = safe_eval(resolve_expr(app_if, env), env)
                         except Exception:
                             ok = False
                         if not ok:
@@ -1504,7 +1419,7 @@ def rank_filters_walkforward(
 
                     seen_ct += 1
                     try:
-                        if safe_eval(resolve_expr(f.expression, env, source=f.source), env):
+                        if safe_eval(resolve_expr(f.expression, env), env):
                             elim_ct += 1
                     except Exception:
                         continue
@@ -1667,10 +1582,10 @@ filters_all = []
 
 # --- LoserList filters ---
 loser_text = None
-if use_loser:
-    if loserlist_uploader is not None:
+if include_loser:
+    if loserlist_upload is not None:
         try:
-            loser_text = loserlist_uploader.getvalue().decode('utf-8', errors='replace')
+            loser_text = loserlist_upload.getvalue().decode('utf-8', errors='replace')
         except Exception as e:
             st.warning(f"Could not read uploaded LoserList filters: {e}")
             loser_text = None
@@ -1686,18 +1601,19 @@ if use_loser:
 
     if loser_text:
         try:
-            ll_filters = load_filter_csv_text(loser_text, source='loserlist')
-            for f in ll_filters:
+            df_ll = pd.read_csv(io.StringIO(loser_text))
+            # tag source
+            for f in df_to_filters(df_ll, source='loserlist'):
                 filters_all.append(f)
         except Exception as e:
             st.warning(f"Could not load LoserList filters: {e}")
 
 # --- Batch10 filters ---
 batch_text = None
-if use_batch10:
-    if batch10_uploader is not None:
+if include_batch10:
+    if batch10_upload is not None:
         try:
-            batch_text = batch10_uploader.getvalue().decode('utf-8', errors='replace')
+            batch_text = batch10_upload.getvalue().decode('utf-8', errors='replace')
         except Exception as e:
             st.warning(f"Could not read uploaded Batch10 filters: {e}")
             batch_text = None
@@ -1710,10 +1626,8 @@ if use_batch10:
 
     if batch_text:
         try:
-            b10_filters = load_filter_csv_text(batch_text, source='batch10')
-            # per instruction: use only first 780 rows
-            b10_filters = b10_filters[:780]
-            for f in b10_filters:
+            df_b10 = pd.read_csv(io.StringIO(batch_text))
+            for f in df_to_filters(df_b10, source='batch10'):
                 filters_all.append(f)
         except Exception as e:
             st.warning(f"Could not load Batch10 filters: {e}")
@@ -1722,7 +1636,7 @@ if use_batch10:
 _seen = set()
 filters_dedup = []
 for f in filters_all:
-    fid = (f.fid or '').strip() or (f.name or '').strip()
+    fid = (f.id or '').strip() or (f.name or '').strip()
     if fid in _seen:
         continue
     _seen.add(fid)
