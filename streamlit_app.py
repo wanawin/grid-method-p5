@@ -958,6 +958,10 @@ class FailureTracker:
     def __init__(self) -> None:
         self.items: list[FailedFilterEval] = []
 
+    def has_any(self) -> bool:
+        """Return True if any filter evaluation failures were recorded."""
+        return bool(self.items)
+
     def add(self, *, fid: str, name: str, expression: str, err: Exception) -> None:
         missing = ""
         try:
@@ -1295,124 +1299,146 @@ class FilterPerf:
     avg_elim_rate: float
 
 
-
 def rank_filters_walkforward(
-    results: List[str],
-    all_filters: List[FilterDef],
-    learning_window_transitions: int,
-    validation_window_transitions: int,
-    percentile_bin_size: int,
+    df_mr: pd.DataFrame,
+    filters: List[FilterDef],
+    cal: CalibrationResult,
+    gen_mode: str,
+    gen_cap: int,
     target_after_bins: int,
-    *,
-    sample_size_per_transition: int = 0,
-    max_filters_to_rank: int = 0,
-    max_seconds: int = 0,
-) -> List[RankedFilter]:
-    """Walk-forward ranking.
+    safety_keep_rate: float = 0.75,
+) -> List[FilterPerf]:
+    """Score each filter on recent walk-forward: keep-rate of winners and elim-rate on pools."""
+    transitions = build_transitions(df_mr)
+    n_trans = len(transitions)
 
-    Adds practical controls:
-    - sample_size_per_transition: cap the number of box candidates evaluated per transition (0 = use full pool)
-    - max_filters_to_rank: cap number of filters evaluated (0 = all)
-    - max_seconds: overall time budget for the ranking run (0 = no limit)
-    """
-    import time
+    vw = cal.validation_window
+    lw = cal.learning_window
 
-    # Build transitions: for each index i, we treat results[i] as seed and results[i+1] as winner.
-    if len(results) < 2:
-        return []
+    val_start = n_trans - vw
+    learn_start = max(0, val_start - lw)
+    learn_trans = transitions[learn_start:val_start]
+    val_trans = transitions[val_start:]
 
-    # Precompute pools per transition (seed -> pool of boxes).
-    pools: List[List[str]] = []
-    winners_box: List[str] = []
+    recent_draws = df_mr.iloc[:20]["result"].tolist()
+    tend = learn_tendencies_from_transitions(learn_trans, recent_draws)
 
-    # We only need pools for the transitions we will touch: learning + validation
-    max_t = min(len(results) - 1, learning_window_transitions + validation_window_transitions)
+    # Precompute pools per validation seed
+    pools = []
+    ctxs = []
+    winners = []
 
-    for i in range(max_t):
-        seed = results[i]
-        winner = results[i + 1]
-        grid_digits = make_grid_digits(seed)
-        candidate_boxes = generate_candidate_boxes(grid_digits, mode=generation_mode)
-        ranked = rank_boxes_by_percentile_bins(candidate_boxes, seed, bin_size=percentile_bin_size)
-        kept = apply_winner_heavy_bins_keep(ranked, winner_heavy_bins)
-        kept = kept[:target_after_bins]
-        if sample_size_per_transition and sample_size_per_transition > 0:
-            kept = kept[:sample_size_per_transition]
-        pools.append(kept)
-        winners_box.append(boxify(winner))
+    # Need loserlist context uses last13 MR->Oldest relative to each seed
+    # We'll build MR-anchored slices by finding seed in df chron.
+    # Simplification: use overall MR slices around the seed when possible.
 
-    # Cut filter list if requested
-    filters = all_filters
-    if max_filters_to_rank and max_filters_to_rank > 0:
-        filters = filters[:max_filters_to_rank]
+    # Build chronological list for locating
+    chron = list(reversed(df_mr["result"].tolist()))
+    idx_map = {r: i for i, r in enumerate(chron)}  # last occurrence; ok for typical use
 
-    start = time.perf_counter()
-    def time_up() -> bool:
-        return bool(max_seconds and (time.perf_counter() - start) >= max_seconds)
+    for seed, winner in val_trans:
+        boxes = generate_candidate_boxes(seed, mode=gen_mode, cap=gen_cap)
+        ranked_scored = rank_candidates(boxes, seed, tend)[:cal.topN]
+        ranked_scored = apply_percentile_bins(ranked_scored, cal.bins, bin_size=cal.bin_size)
+        ranked_scored = ranked_scored[:target_after_bins]
+        pool = [b for b, _ in ranked_scored]
+        pools.append(pool)
+        winners.append(winner)
 
-    ranked_filters: List[RankedFilter] = []
+        # prev/prev2 for env: use seed's previous draws chronologically
+        i = idx_map.get(seed)
+        if i is None or i < 2:
+            prev = seed
+            prev2 = seed
+            last13 = [seed] * 13
+            last20 = [seed] * 20
+        else:
+            prev = chron[i - 1]
+            prev2 = chron[i - 2]
+            # last13 MR->Oldest relative to "seed" as MR
+            slice_rev = list(reversed(chron[max(0, i - 12): i + 1]))
+            last13 = slice_rev + [slice_rev[-1]] * (13 - len(slice_rev))
+            slice20 = list(reversed(chron[max(0, i - 19): i + 1]))
+            last20 = slice20 + [slice20[-1]] * (20 - len(slice20))
+
+        ll_ctx = None
+        try:
+            ll_ctx = loser_list_ctx(last13, last20)
+        except Exception:
+            ll_ctx = None
+        ctxs.append((seed, prev, prev2, ll_ctx))
+
+    perfs = []
 
     for f in filters:
-        if time_up():
-            break
-
-        keep_hits = 0
-        keep_total = 0
+        applies = 0
+        winner_kept = 0
         elim_rates = []
-        apply_count = 0
 
-        # For each validation transition, train on the previous learning window.
-        # We estimate a "safe to apply" score using: winner keep-rate and average elim-rate.
-        for t in range(learning_window_transitions, min(len(pools), learning_window_transitions + validation_window_transitions)):
-            if time_up():
-                break
+        for pool, (seed, prev, prev2, ll_ctx), winner in zip(pools, ctxs, winners):
+            if not pool:
+                continue
+            if f.source == "loserlist" and ll_ctx is None:
+                continue
 
-            # validation transition t uses pool[t] and winner_box[t]
-            pool = pools[t]
-            winner_b = winners_box[t]
+            # resolve expr for this run
+            app_if = f.applicable_if or "True"
+            expr = f.expression or "False"
+            if f.source == "loserlist":
+                app_if = resolve_loserlist_expression(app_if, ll_ctx)
+                expr = resolve_loserlist_expression(expr, ll_ctx)
 
-            # Apply filter to pool
-            ft = FailureTracker()
-            survivors, _, _ = evaluate_filters_on_pool(
-                pool,
-                [FilterDef(fid=f.fid, name=f.name, enabled_default=True, expression=f.expression, source=f.source)],
-                context_builder,
-                ft,
-            )
-            apply_count += 1
-
+            # apply filter once on the pool
             before = len(pool)
-            after = len(survivors)
-            elim = (before - after) / before if before else 0.0
-            elim_rates.append(elim)
+            kept = []
+            eliminated = 0
+            wbox = "".join(sorted(winner))
+            w_in_before = wbox in pool
+            w_in_after = False
 
-            keep_total += 1
-            if winner_b in survivors:
-                keep_hits += 1
+            for box in pool:
+                env = build_filter_env(seed, prev, prev2, box, extra_ctx=(ll_ctx or {}))
+                if not safe_eval(app_if, env):
+                    kept.append(box)
+                    continue
+                applies += 1
+                if safe_eval(expr, env):
+                    eliminated += 1
+                else:
+                    kept.append(box)
 
-        if keep_total == 0:
-            continue
+            after = len(kept)
+            if before > 0:
+                elim_rates.append(eliminated / before)
 
-        winner_keep_rate = keep_hits / keep_total
-        avg_elim_rate = sum(elim_rates) / len(elim_rates) if elim_rates else 0.0
-        score = (winner_keep_rate * 0.75) + (avg_elim_rate * 0.25)
+            if w_in_before:
+                if wbox in kept:
+                    w_in_after = True
+                    winner_kept += 1
+                else:
+                    winner_kept += 0
 
-        ranked_filters.append(
-            RankedFilter(
-                fid=f.fid,
-                name=f.name,
-                source=f.source,
-                winner_keep_rate=winner_keep_rate,
-                avg_elim_rate=avg_elim_rate,
-                apply_count=apply_count,
-                score=score,
-            )
-        )
+        # keep_rate measured only on cases where winner was present pre-filter in pool
+        # approximate by dividing by count of validation draws with winner in pool
+        denom = 0
+        for pool, (_, _, _, _), winner in zip(pools, ctxs, winners):
+            if "".join(sorted(winner)) in pool:
+                denom += 1
+        keep_rate = (winner_kept / denom) if denom else 1.0
+        avg_elim = float(sum(elim_rates) / len(elim_rates)) if elim_rates else 0.0
 
-    ranked_filters.sort(key=lambda r: (-r.score, -r.winner_keep_rate, -r.avg_elim_rate, r.fid))
+        perfs.append(FilterPerf(
+            fid=f.fid,
+            name=f.name,
+            source=f.source,
+            apply_count=applies,
+            keep_rate=float(keep_rate),
+            avg_elim_rate=float(avg_elim),
+        ))
 
-    # "Safe" filters are those with strong keep-rate.
-    safe = ranked_filters
+    # Rank: safest first, then more aggressive
+    safe = [p for p in perfs if p.keep_rate >= safety_keep_rate]
+    safe.sort(key=lambda p: (-p.keep_rate, -p.avg_elim_rate, p.fid))
     return safe
 
 
@@ -1647,379 +1673,138 @@ except Exception:
     ll_ctx = None
 
 
+st.subheader("Dynamic filter ranking (walk-forward)")
+with st.spinner("Ranking filters on this history (walk-forward)..."):
+    ranked_filters = rank_filters_walkforward(
+        df_mr=df,
+        filters=filters_all,
+        cal=cal,
+        gen_mode=gen_mode,
+        gen_cap=int(gen_cap),
+        target_after_bins=max(int(target_final) * 4, 450),
+        safety_keep_rate=float(safety_keep_rate),
+    )
 
-    st.subheader("Dynamic filter ranking (walk-forward)")
+records = [
+    {
+        "id": p.fid,
+        "name": p.name,
+        "source": p.source,
+        "winner_keep_rate": round(p.keep_rate, 3),
+        "avg_elim_rate": round(p.avg_elim_rate, 3),
+        "apply_count": p.apply_count,
+    }
+    for p in ranked_filters
+]
 
-    colA, colB, colC = st.columns(3)
-    with colA:
-        rank_sample_size = st.number_input(
-            "Ranking sample size (boxes per transition)",
-            min_value=10,
-            max_value=5000,
-            value=int(st.session_state.get("rank_sample_size", 80)),
-            step=10,
-        )
-    with colB:
-        max_filters_rank = st.number_input(
-            "Max filters to rank (0 = all)",
-            min_value=0,
-            max_value=5000,
-            value=int(st.session_state.get("max_filters_rank", 0)),
-            step=10,
-        )
-    with colC:
-        max_seconds_rank = st.number_input(
-            "Max seconds per rank run",
-            min_value=10,
-            max_value=600,
-            value=int(st.session_state.get("max_seconds_rank", 90)),
-            step=5,
-        )
+df_perf = pd.DataFrame.from_records(records)
+if df_perf.empty:
+    df_perf = pd.DataFrame(columns=["id", "name", "source", "winner_keep_rate", "avg_elim_rate", "apply_count"])
 
-    st.session_state["rank_sample_size"] = int(rank_sample_size)
-    st.session_state["max_filters_rank"] = int(max_filters_rank)
-    st.session_state["max_seconds_rank"] = int(max_seconds_rank)
+st.dataframe(df_perf.head(50), use_container_width=True)
+st.caption("Auto-apply order = safest → more aggressive (among those meeting keep-rate threshold)")
 
-    if "ranked_filters" not in st.session_state:
-        st.session_state["ranked_filters"] = []
-    if "ranked_filters_ts" not in st.session_state:
-        st.session_state["ranked_filters_ts"] = None
 
-    run_rank = st.button("Run / Refresh filter ranking", type="primary")
+st.subheader("Apply filters automatically to reach target")
 
-    ranked_filters: List[RankedFilter] = st.session_state.get("ranked_filters", [])
+if len(ranked_filters) == 0:
+    apply_count = 0
+else:
+    apply_count = st.slider("Max filters to auto-apply", 0, min(100, len(ranked_filters)), min(25, len(ranked_filters)))
 
-    if run_rank:
-        with st.spinner("Ranking filters (walk-forward)..."):
-            ranked_filters = rank_filters_walkforward(
-                results=df["result"].tolist(),
-                all_filters=filters_all,
-                learning_window_transitions=int(learn),
-                validation_window_transitions=int(validate),
-                percentile_bin_size=int(bin_size),
-                target_after_bins=int(target_after_bins),
-                sample_size_per_transition=int(rank_sample_size),
-                max_filters_to_rank=int(max_filters_rank),
-                max_seconds=int(max_seconds_rank),
-            )
-        st.session_state["ranked_filters"] = ranked_filters
-        st.session_state["ranked_filters_ts"] = time.time()
-
-    if not ranked_filters:
-        st.info("No ranking computed yet. Click Run / Refresh filter ranking.")
+    # Robustly pick the ID column (some runs may produce an empty df without columns)
+    id_col = 'id' if 'id' in df_perf.columns else ('filter_id' if 'filter_id' in df_perf.columns else None)
+    if id_col is None:
+        to_apply_ids = set()
     else:
-        show_ranked_filters(ranked_filters[: min(200, len(ranked_filters))])
-        st.caption(
-            "Auto-apply order = safest → more aggressive (among those meeting keep-rate threshold)"
+        to_apply_ids = set(df_perf.head(apply_count)[id_col].astype(str).tolist())
+filters_to_apply = [f for f in filters_all if f.fid in to_apply_ids]
+
+# Preserve the ranked order from df_perf
+order_list = df_perf.head(apply_count)[id_col].astype(str).tolist() if id_col else []
+order = {fid: i for i, fid in enumerate(order_list)}
+filters_to_apply.sort(key=lambda f: order.get(f.fid, 999999))
+
+survivors, log, failure_tracker = evaluate_filters_on_pool(
+    pool=ranked_pool,
+    filters=filters_to_apply,
+    seed=seed,
+    prev=prev,
+    prev2=prev2,
+    loser_ctx=ll_ctx,
+)
+
+st.write(f"After auto filters: **{len(survivors)}**")
+
+log_df = pd.DataFrame(log, columns=["filter_id", "before", "after"])
+st.dataframe(log_df, use_container_width=True)
+
+# Show failed filters (failsafe kept, but nothing is silent)
+if failure_tracker.has_any():
+    st.warning(f"Filters failed (error → automatically returned False): {len(failure_tracker.items)}")
+    with st.expander("Show failed filters (fix these in the filter files)", expanded=False):
+        fail_df = failure_tracker.to_dataframe()
+        st.dataframe(fail_df, use_container_width=True)
+
+        st.download_button(
+            "Download failed filters report (csv)",
+            data=fail_df.to_csv(index=False),
+            file_name=f"failed_filters_{stream_name}.csv",
         )
 
-    st.subheader("Apply filters automatically to reach target")
-
-    enable_auto_apply = st.checkbox(
-        "Enable auto-apply learned filters",
-        value=bool(st.session_state.get("enable_auto_apply", False)),
-    )
-    st.session_state["enable_auto_apply"] = bool(enable_auto_apply)
-
-    keep_rate_threshold = st.slider(
-        "Winner keep-rate threshold",
-        min_value=0.50,
-        max_value=1.00,
-        value=float(st.session_state.get("keep_rate_threshold", 0.90)),
-        step=0.01,
-    )
-    st.session_state["keep_rate_threshold"] = float(keep_rate_threshold)
-
-    max_to_apply = st.slider(
-        "Initial Top-N after ranking",
-        min_value=0,
-        max_value=2000,
-        value=int(st.session_state.get("max_to_apply", 500)),
-        step=25,
-    )
-    st.session_state["max_to_apply"] = int(max_to_apply)
-
-    target_final = st.slider(
-        "Target final pool size",
-        min_value=10,
-        max_value=2000,
-        value=int(st.session_state.get("target_final", 150)),
-        step=10,
-    )
-    st.session_state["target_final"] = int(target_final)
-
-    # Track a combo (straight or box)
-    st.markdown("---")
-    st.subheader("Apply filters manually (1-by-1, guided)")
-
-    track_combo = st.text_input(
-        "Track a 5-digit combo (straight or box)",
-        value=str(st.session_state.get("track_combo", "")),
-        help="Enter a 5-digit string. We'll track its BOX form through the pool and filters.",
-    ).strip()
-    st.session_state["track_combo"] = track_combo
-
-    tracked_box = None
-    if track_combo:
-        digits = re.findall(r"\d", track_combo)
-        if len(digits) == 5:
-            tracked_box = boxify("".join(digits))
-
-    # Starting pools
-    ranked_pool = after_percentile  # boxes after percentile-bin keep (pre filter ranking)
-
-    # Auto-apply learned filters (optional)
-    auto_log = []
-    auto_pool = ranked_pool
-
-    if enable_auto_apply and ranked_filters:
-        # Choose eligible filters
-        eligible = [rf for rf in ranked_filters if rf.winner_keep_rate >= keep_rate_threshold]
-        eligible = eligible[: max_to_apply] if max_to_apply else eligible
-
-        # Apply until we reach target_final or run out
-        ft = FailureTracker()
-        applied = []
-        for rf in eligible:
-            if len(auto_pool) <= target_final:
-                break
-            # Find the FilterDef
-            fdef = next((f for f in filters_all if f.fid == rf.fid), None)
-            if not fdef:
-                continue
-            before = len(auto_pool)
-            survivors, _, _ = evaluate_filters_on_pool(
-                auto_pool,
-                [FilterDef(fid=fdef.fid, name=fdef.name, enabled_default=True, expression=fdef.expression, source=fdef.source)],
-                context_builder,
-                ft,
-            )
-            after = len(survivors)
-            auto_log.append(
-                {
-                    "fid": fdef.fid,
-                    "name": fdef.name,
-                    "before": before,
-                    "after": after,
-                    "eliminated": before - after,
-                    "tracked_kept": (tracked_box in survivors) if tracked_box else None,
-                }
-            )
-            auto_pool = survivors
-            applied.append(fdef.fid)
-
-        if ft.failed:
-            st.warning(f"Filters failed during auto-apply: {len(ft.failed)} (see details below)")
-            st.dataframe(ft.to_frame(), use_container_width=True, hide_index=True)
-
-        if auto_log:
-            st.success(
-                f"Auto-apply complete. Pool: {len(ranked_pool)} → {len(auto_pool)} (applied {len(auto_log)} filters)"
-            )
-            st.dataframe(pd.DataFrame(auto_log), use_container_width=True, hide_index=True)
-        else:
-            st.info("Auto-apply is ON, but no filters were applied (already at target or none met threshold).")
-
-    else:
-        st.info("Auto-apply is OFF. Use the manual section below to apply filters 1-by-1.")
-
-    # Explain why tracked combo may not exist
-    if tracked_box:
-        in_gen = tracked_box in boxes
-        in_ranked = tracked_box in ranked_pool
-        st.caption(
-            f"Tracking BOX form: **{tracked_box}** — in generated pool: {in_gen} | after percentile keep: {in_ranked} | after auto: {tracked_box in auto_pool}"
-        )
-        if not in_gen:
-            st.warning(
-                "Tracked combo is not in the generated pool. That means the current generation mode never created its BOX form."
-            )
-        elif (generation_mode == "two_pairs_plus_non_grid") and not in_ranked:
-            # helpful hint for the most common confusion
-            non_grid = sorted(set(DIGITS) - set(grid_digits))
-            st.warning(
-                f"Your generation mode requires at least one *non-grid* digit. For this seed, non-grid digits are: {non_grid}. "
-                "If your tracked combo doesn't include any of them, it cannot appear in the pool."
-            )
-
-    # Manual apply state
-    if "manual_pool" not in st.session_state:
-        st.session_state["manual_pool"] = []
-    if "manual_log" not in st.session_state:
-        st.session_state["manual_log"] = []
-    if "manual_applied" not in st.session_state:
-        st.session_state["manual_applied"] = []
-
-    start_from = st.radio(
-        "Start manual run from",
-        options=[
-            "Pool entering ranking (after percentile-bin keep)",
-            "After auto filters",
-        ],
-        index=1,
-        horizontal=False,
-    )
-
-    if st.button("Reset manual filter run"):
-        st.session_state["manual_pool"] = []
-        st.session_state["manual_log"] = []
-        st.session_state["manual_applied"] = []
-
-    base_pool = ranked_pool if start_from.startswith("Pool") else auto_pool
-
-    if not st.session_state["manual_pool"]:
-        st.session_state["manual_pool"] = list(base_pool)
-
-    manual_pool = st.session_state["manual_pool"]
-
-    # Choose filter list: ranked order if ranking exists, else all
-    if ranked_filters:
-        ranked_ids = [rf.fid for rf in ranked_filters]
-        ordered_filters = [f for fid in ranked_ids for f in filters_all if f.fid == fid]
-        # append any not ranked
-        ranked_set = set(ranked_ids)
-        ordered_filters += [f for f in filters_all if f.fid not in ranked_set]
-    else:
-        ordered_filters = list(filters_all)
-
-    # Remove already-applied from list
-    applied_set = set(st.session_state["manual_applied"])
-    remaining_filters = [f for f in ordered_filters if f.fid not in applied_set]
-
-    # Search
-    search_q = st.text_input("Filter search (id or name)", value="").strip().lower()
-    if search_q:
-        remaining_filters = [f for f in remaining_filters if search_q in f.fid.lower() or search_q in f.name.lower()]
-
-    if not remaining_filters:
-        st.info("No remaining filters to apply.")
-    else:
-        pick = st.selectbox(
-            "Select next filter to apply",
-            options=list(range(len(remaining_filters))),
-            format_func=lambda i: f"{remaining_filters[i].fid}: {remaining_filters[i].name}  [{remaining_filters[i].source}]",
-        )
-        next_filter = remaining_filters[pick]
-
-        col1, col2 = st.columns([1, 1])
-        with col1:
-            apply_one = st.button("Apply selected filter")
-        with col2:
-            preview = st.button("Preview elimination (no apply)")
-
-        def run_one(fdef: FilterDef, pool_in: List[str]):
-            ft = FailureTracker()
-            survivors, _, _ = evaluate_filters_on_pool(
-                pool_in,
-                [FilterDef(fid=fdef.fid, name=fdef.name, enabled_default=True, expression=fdef.expression, source=fdef.source)],
-                context_builder,
-                ft,
-            )
-            return survivors, ft
-
-        if preview:
-            survivors, ft = run_one(next_filter, manual_pool)
-            st.write(
-                f"Would eliminate **{len(manual_pool) - len(survivors)}** (pool {len(manual_pool)} → {len(survivors)})."
-            )
-            if tracked_box:
-                st.write(f"Tracked combo kept: **{tracked_box in survivors}**")
-            if ft.failed:
-                st.warning(f"This filter failed on some combos: {len(ft.failed)}")
-                st.dataframe(ft.to_frame(), use_container_width=True, hide_index=True)
-
-        if apply_one:
-            survivors, ft = run_one(next_filter, manual_pool)
-            before = len(manual_pool)
-            after = len(survivors)
-            st.session_state["manual_pool"] = survivors
-            st.session_state["manual_applied"].append(next_filter.fid)
-            st.session_state["manual_log"].append(
-                {
-                    "fid": next_filter.fid,
-                    "name": next_filter.name,
-                    "before": before,
-                    "after": after,
-                    "eliminated": before - after,
-                    "tracked_kept": (tracked_box in survivors) if tracked_box else None,
-                    "failed_count": len(ft.failed),
-                }
-            )
-
-            st.success(f"Applied {next_filter.fid}. Pool: {before} → {after}")
-            if tracked_box:
-                st.write(f"Tracked combo kept: **{tracked_box in survivors}**")
-            if ft.failed:
-                st.warning(f"Filter had failures: {len(ft.failed)}")
-                st.dataframe(ft.to_frame(), use_container_width=True, hide_index=True)
-
-    # Show manual log
-    if st.session_state.get("manual_log"):
-        st.markdown("#### Manual run log")
-        log_df = pd.DataFrame(st.session_state["manual_log"])
-        st.dataframe(log_df, use_container_width=True, hide_index=True)
-
-        # If tracked combo fell out, show first filter that removed it
-        if tracked_box:
-            removed_at = None
-            for row in st.session_state["manual_log"]:
-                if row.get("tracked_kept") is False:
-                    removed_at = row
-                    break
-            if removed_at:
-                st.error(
-                    f"Tracked combo dropped at **{removed_at['fid']}** — {removed_at['name']}"
-                )
-
-        # Copy/paste log
-        st.text_area(
-            "Copy/paste manual log",
-            value="\n".join(
-                [
-                    f"{r['fid']}	{r['before']}→{r['after']}	(-{r['eliminated']})	tracked_kept={r['tracked_kept']}"
-                    for r in st.session_state["manual_log"]
-                ]
-            ),
-            height=140,
+        # TXT summary (copy/paste-friendly)
+        lines = []
+        for row in failure_tracker.items:
+            lines.append(f"{row.fid}: {row.name} → {row.error_type}: {row.message}")
+            if row.missing_vars:
+                lines.append(f"  missing_vars: {', '.join(row.missing_vars)}")
+            lines.append(f"  expr: {row.expression}")
+            lines.append("")
+        st.download_button(
+            "Download failed filters report (txt)",
+            data="\n".join(lines).strip() + "\n",
+            file_name=f"failed_filters_{stream_name}.txt",
         )
 
-    # Choose which pool drives final ranking
-    st.markdown("---")
-    st.subheader("Final pool (box, ranked most-likely → least-likely)")
 
-    pool_choice = st.radio(
-        "Use which pool for final ranking + straight recommendations?",
-        options=["Auto (recommended)", "Manual"],
-        index=0,
-        horizontal=False,
-    )
+# Trim to target_final while keeping order by original ranking score
+rank_index = {b: i for i, (b, _) in enumerate(ranked_scored_bins)}
+survivors.sort(key=lambda b: rank_index.get(b, 10**9))
+final_pool = survivors[:int(target_final)]
 
-    final_pool = auto_pool if pool_choice.startswith("Auto") else st.session_state.get("manual_pool", auto_pool)
+st.subheader("Final pool (box, ranked most-likely → least-likely)")
 
-    final_ranked = rank_boxes_by_percentile_bins(final_pool, seed, bin_size=percentile_bin_size)
+final_df = pd.DataFrame({
+    "rank": list(range(1, len(final_pool) + 1)),
+    "box": final_pool,
+})
+st.dataframe(final_df, use_container_width=True)
 
-    st.dataframe(
-        pd.DataFrame({"rank": list(range(1, len(final_ranked) + 1)), "box": final_ranked}),
-        use_container_width=True,
-        hide_index=True,
-    )
 
-    st.subheader("Straight recommendations (ranked)")
-    how_many_boxes = st.slider("How many box combos to expand into straights", 1, 200, 25)
-    max_straights_per_box = st.slider("Max straights per box", 1, 120, 24)
+st.subheader("Straight recommendations (ranked)")
 
-    top_boxes_for_straights = final_ranked[:how_many_boxes]
+straight_limit = st.slider("How many box combos to expand into straights", 1, len(final_pool), min(25, len(final_pool)))
+max_straights_per_box = st.slider("Max straights per box", 1, 120, 24)
 
-    straight_rows = []
-    for bi, b in enumerate(top_boxes_for_straights, start=1):
-        ss = permute_unique(b)
-        ss = ss[:max_straights_per_box]
-        for si, s in enumerate(ss, start=1):
-            straight_rows.append({"box_rank": bi, "straight_rank": si, "straight": s, "box": b})
+straight_rows = []
+for i, box in enumerate(final_pool[:straight_limit], start=1):
+    straights = straight_rankings_from_box(box, tend, seed)[:max_straights_per_box]
+    for j, s in enumerate(straights, start=1):
+        straight_rows.append({"box_rank": i, "straight_rank": j, "straight": s, "box": box})
 
-    st.dataframe(pd.DataFrame(straight_rows), use_container_width=True, hide_index=True)
+straight_df = pd.DataFrame(straight_rows)
+st.dataframe(straight_df, use_container_width=True)
 
-    st.caption(
-        "Tip: If your tracked combo never enters the pool, switch generation mode (or broaden it). "
-        "If it enters and then drops, the manual log will show exactly which filter removed it."
-    )
+
+st.download_button(
+    "Download final BOX list (txt)",
+    data="\n".join(final_pool),
+    file_name=f"pick5_final_box_{stream_name}.txt",
+)
+
+st.download_button(
+    "Download straight recommendations (csv)",
+    data=straight_df.to_csv(index=False),
+    file_name=f"pick5_straights_{stream_name}.csv",
+    mime="text/csv",
+)
