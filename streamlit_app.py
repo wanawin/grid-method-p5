@@ -1,2002 +1,970 @@
-import io
-import re
-import math
-from dataclasses import dataclass
-from datetime import datetime
-from itertools import combinations_with_replacement, product
-from collections import Counter, defaultdict
-from typing import Any, Dict, List, Tuple, Optional, Iterable, Set
-
-import pandas as pd
-import streamlit as st
-import warnings
-warnings.filterwarnings('ignore', category=SyntaxWarning, message='invalid decimal literal')
-
-
-
-# =========================================================
-# Pick-5 SeedGrid + Dynamic Walk-Forward + Dynamic Filters
-#
-# Goals (as requested):
-# 1) Reduce to ~450-500 candidates using grid+percentile-style ranking
-# 2) Auto walk-forward choose best windows (120/180/240 learn; 60/90 validate)
-# 3) Incorporate Loser List filters + Batch10 filters (dedupe redundant)
-# 4) Dynamically score & rank filters per history file (per stream)
-# 5) Apply filters automatically in safe->aggressive order until target
-# 6) Final list ordered most-likely->least-likely AND emit straight-order list
+# streamlit_app.py
+# Pick-4 (3389 / 3889 / 3899 families) prediction helper:
+# - Master ranking: all streams (State/Game) scored for likelihood a family hits next
+# - Straight ordering learner: per State/Game, rank the 12 unique straights for each family
 #
 # Notes:
-# - This app is stream-agnostic. It expects a history file with one result per line.
-# - It supports LotteryPost-like lines: "Sat, Dec 27, 2025    46894"
-# - Winner checks are BOX-based for filters; straight list is derived at the end.
-# =========================================================
-
-
-st.set_page_config(page_title="Pick 5 SeedGrid + Walk-Forward (Dynamic)", layout="wide")
-
-
-DIGITS = list("0123456789")
-MIRROR = {0: 5, 1: 6, 2: 7, 3: 8, 4: 9, 5: 0, 6: 1, 7: 2, 8: 3, 9: 4}
-
-# Keep DC-5-style mappings for Batch10 compatibility
-V_TRAC_GROUPS = {0: 1, 5: 1, 1: 2, 6: 2, 2: 3, 7: 3, 3: 4, 8: 4, 4: 5, 9: 5}
-V_TRAC = V_TRAC_GROUPS
-VTRAC_GROUPS = V_TRAC_GROUPS
-vtrac = V_TRAC_GROUPS
-mirror = MIRROR
-
-
-# -------------------------
-# Parsing history
-# -------------------------
-
-MONTHS = {
-    "jan": 1, "january": 1,
-    "feb": 2, "february": 2,
-    "mar": 3, "march": 3,
-    "apr": 4, "april": 4,
-    "may": 5,
-    "jun": 6, "june": 6,
-    "jul": 7, "july": 7,
-    "aug": 8, "august": 8,
-    "sep": 9, "sept": 9, "september": 9,
-    "oct": 10, "october": 10,
-    "nov": 11, "november": 11,
-    "dec": 12, "december": 12,
-}
-
-
-def _normalize_quotes(text: str) -> str:
-    if text is None:
-        return ""
-    return (
-        str(text)
-        .replace("\u201c", '"').replace("\u201d", '"')
-        .replace("\u2018", "'").replace("\u2019", "'")
-        .replace("\r\n", "\n").replace("\r", "\n")
-    )
-
-
-def parse_date_any(line: str) -> Optional[datetime]:
-    """Attempt to parse a date from many common history formats."""
-    s = line.strip()
-
-    # mm/dd/yyyy or m/d/yy
-    m = re.search(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b", s)
-    if m:
-        mm, dd, yy = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        if yy < 100:
-            yy += 2000
-        try:
-            return datetime(yy, mm, dd)
-        except Exception:
-            return None
-
-    # LotteryPost style: "Sat, Dec 27, 2025"
-    m = re.search(r"\b([A-Za-z]{3,9})\s+(\d{1,2}),\s*(\d{4})\b", s)
-    if m:
-        mon = MONTHS.get(m.group(1).lower())
-        if mon:
-            dd, yy = int(m.group(2)), int(m.group(3))
-            try:
-                return datetime(yy, mon, dd)
-            except Exception:
-                return None
-
-    # yyyy-mm-dd
-    m = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", s)
-    if m:
-        yy, mm, dd = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        try:
-            return datetime(yy, mm, dd)
-        except Exception:
-            return None
-
-    return None
-
-
-def extract_last_5digit_result(line: str) -> Optional[str]:
-    """Return the last Pick-5 style result on the line.
-
-    History sources use multiple formats. We support:
-      - contiguous: 46894
-      - separated: 4-6-8-9-4, 4 6 8 9 4, 4,6,8,9,4
-    We intentionally *avoid* manufacturing results from date fragments.
-    """
-
-    # 1) Common case: a standalone 5-digit token
-    # Use digit-boundaries (not word-boundaries) to handle cases like "46894," or "46894)".
-    nums = re.findall(r"(?<!\d)\d{5}(?!\d)", line)
-    if nums:
-        return nums[-1]
-
-    # 2) Hyphen/space/comma separated digits: 4-6-8-9-4, 4 6 8 9 4, etc.
-    # Require separators between digits to prevent accidental captures from years.
-    parts = re.findall(r"(?<!\d)(\d)\D+(\d)\D+(\d)\D+(\d)\D+(\d)(?!\d)", line)
-    if parts:
-        d1, d2, d3, d4, d5 = parts[-1]
-        return f"{d1}{d2}{d3}{d4}{d5}"
-
-    return None
-
-
-def load_history_from_text(text: str) -> pd.DataFrame:
-    """Returns DataFrame with columns: date (datetime or NaT), result (str)."""
-    text = _normalize_quotes(text or "")
-    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
-    rows = []
-    for ln in lines:
-        res = extract_last_5digit_result(ln)
-        if not res:
-            continue
-        dt = parse_date_any(ln)
-        rows.append({"date": dt, "result": res, "raw": ln})
-    if not rows:
-        raise ValueError("No 5-digit results found in the uploaded history.")
-
-    df = pd.DataFrame(rows)
-
-    # If no dates at all, preserve order as-is (assume already MR→Oldest)
-    if df["date"].notna().sum() == 0:
-        df["idx"] = range(len(df))
-        # assume top of file is most recent
-        df = df.sort_values("idx", ascending=True).drop(columns=["idx"]).reset_index(drop=True)
-        return df
-
-    # Otherwise sort by date descending; stable tie-breaker by appearance order
-    df["idx"] = range(len(df))
-    df = df.sort_values(["date", "idx"], ascending=[False, True]).drop(columns=["idx"]).reset_index(drop=True)
-    return df
-
-
-# -------------------------
-# Grid + candidate generation
-# -------------------------
-
-
-def digits_of(nstr: str) -> List[int]:
-    return [int(c) for c in nstr]
-
-
-def mirror_digits(ds: Iterable[int]) -> List[int]:
-    return [MIRROR[int(d)] for d in ds]
-
-
-def plus1_digits(ds: Iterable[int]) -> List[int]:
-    return [(int(d) + 1) % 10 for d in ds]
-
-
-def minus1_digits(ds: Iterable[int]) -> List[int]:
-    return [(int(d) - 1) % 10 for d in ds]
-
-
-def make_grid_sets(seed: str) -> Dict[str, List[int]]:
-    s = digits_of(seed)
-    return {
-        "seed": s,
-        "+1": plus1_digits(s),
-        "-1": minus1_digits(s),
-        "mirror": mirror_digits(s),
-    }
-
-
-def box_key_from_digits(ds: List[int]) -> str:
-    return "".join(str(d) for d in sorted(ds))
-
-
-def build_pair_pool(digits_set: Set[int]) -> List[Tuple[int, int]]:
-    ds = sorted(digits_set)
-    return list(combinations_with_replacement(ds, 2))
-
-
-def generate_candidate_boxes(
-    seed: str,
-    mode: str = "two_pairs_plus_non_grid",
-    cap: int = 20000,
-    rng_seed: int = 0,
-) -> List[str]:
-    """Generate box-unique 5-digit combos (as sorted string) with repeats allowed."""
-    grid = make_grid_sets(seed)
-    grid_digits = set(grid["seed"]) | set(grid["+1"]) | set(grid["-1"]) | set(grid["mirror"])
-    non_grid_digits = set(range(10)) - set(grid_digits)
-
-    # pair pools
-    seed_plus = set(grid["seed"]) | set(grid["+1"]) | set(grid["-1"])
-    pair_seed = build_pair_pool(seed_plus)
-    pair_grid = build_pair_pool(grid_digits)
-    pair_mirror = build_pair_pool(set(grid["mirror"]))
-
-    # Use deterministic ordering (no random) to keep runs stable.
-    out: Set[str] = set()
-
-    def add_box(digits5: List[int]):
-        out.add(box_key_from_digits(digits5))
-
-    # Mode choices:
-    # - two_pairs_plus_non_grid: (seed-pair) + (grid-pair) + (one non-grid digit)
-    # - two_pairs_plus_grid:     (seed-pair) + (grid-pair) + (one grid digit)
-    # - mirror_pair_mix:         (seed-pair) + (mirror-pair) + (one non-grid digit)
-    if mode == "two_pairs_plus_non_grid":
-        fifth_pool = sorted(non_grid_digits) if non_grid_digits else sorted(grid_digits)
-        for a in pair_seed:
-            for b in pair_grid:
-                for c in fifth_pool:
-                    add_box([a[0], a[1], b[0], b[1], c])
-                    if len(out) >= cap:
-                        return sorted(out)
-
-    elif mode == "two_pairs_plus_grid":
-        fifth_pool = sorted(grid_digits)
-        for a in pair_seed:
-            for b in pair_grid:
-                for c in fifth_pool:
-                    add_box([a[0], a[1], b[0], b[1], c])
-                    if len(out) >= cap:
-                        return sorted(out)
-
-    elif mode == "mirror_pair_mix":
-        fifth_pool = sorted(non_grid_digits) if non_grid_digits else sorted(grid_digits)
-        for a in pair_seed:
-            for b in pair_mirror:
-                for c in fifth_pool:
-                    add_box([a[0], a[1], b[0], b[1], c])
-                    if len(out) >= cap:
-                        return sorted(out)
-    else:
-        raise ValueError(f"Unknown generation mode: {mode}")
-
-    return sorted(out)
-
-
-# -------------------------
-# Dynamic stats (hot/cold/due etc)
-# -------------------------
-
-
-def last_n_draws(df: pd.DataFrame, start_idx: int, n: int) -> List[str]:
-    """From df sorted MR->Oldest: start_idx is seed index, return df[start_idx : start_idx+n]."""
-    return df.iloc[start_idx:start_idx + n]["result"].tolist()
-
-
-def digit_freq(draws: List[str]) -> Counter:
-    c = Counter()
-    for r in draws:
-        c.update(list(r))
-    for d in DIGITS:
-        c.setdefault(d, 0)
-    return c
-
-
-def hot_cold_sets(draws: List[str], hot_k: int = 3, cold_k: int = 3) -> Tuple[List[int], List[int]]:
-    c = digit_freq(draws)
-    # hot: highest count, then digit asc
-    hot = sorted(DIGITS, key=lambda d: (-c[d], int(d)))[:hot_k]
-    cold = sorted(DIGITS, key=lambda d: (c[d], int(d)))[:cold_k]
-    return [int(x) for x in hot], [int(x) for x in cold]
-
-
-def due_last2(prev: str, prev2: str) -> List[int]:
-    miss = set(DIGITS) - set(prev) - set(prev2)
-    return sorted([int(x) for x in miss])
-
-
-def sum_category(total: int) -> str:
-    if 0 <= total <= 15:
-        return 'Very Low'
-    if 16 <= total <= 24:
-        return 'Low'
-    if 25 <= total <= 33:
-        return 'Mid'
-    return 'High'
-
-
-def structure_of(digits: List[int]) -> str:
-    counts = sorted(Counter(digits).values(), reverse=True)
-    if counts == [1, 1, 1, 1, 1]:
-        return 'SINGLE'
-    if counts == [2, 1, 1, 1]:
-        return 'DOUBLE'
-    if counts == [2, 2, 1]:
-        return 'DOUBLE-DOUBLE'
-    if counts == [3, 1, 1]:
-        return 'TRIPLE'
-    if counts == [3, 2]:
-        return 'TRIPLE-DOUBLE'
-    if counts == [4, 1]:
-        return 'QUAD'
-    if counts == [5]:
-        return 'QUINT'
-    return f'OTHER-{counts}'
-
-
-# -------------------------
-# Scoring candidates (grid + learned tendencies)
-# -------------------------
-
-
-@dataclass
-class LearnedTendencies:
-    hot_digits: List[int]
-    cold_digits: List[int]
-    due_bias_digits: List[int]
-    # seed-winner tendencies (learned)
-    typical_seed_overlap: List[int]  # preferred overlaps (e.g., [1,2])
-    structure_weights: Dict[str, float]
-    sum_mean: float
-    sum_sd: float
-
-
-def learn_tendencies_from_transitions(
-    transitions: List[Tuple[str, str]],
-    hotcold_draws: List[str],
-) -> LearnedTendencies:
-    """Learn broad tendencies from (seed, next_winner) transitions."""
-    # Hot/cold from recent context (last 20 by default outside)
-    hot, cold = hot_cold_sets(hotcold_draws, hot_k=3, cold_k=3)
-
-    overlap_counts = []
-    struct_counts = Counter()
-    sums = []
-    due_hits = Counter()
-
-    for seed, nxt in transitions:
-        sset = set(seed)
-        o = len(set(nxt) & sset)
-        overlap_counts.append(o)
-        digs = [int(x) for x in nxt]
-        struct_counts[structure_of(digs)] += 1
-        sums.append(sum(digs))
-
-        # due digits relative to the seed and its prev2 are unknown here; we approximate
-        # due tendency as "digits that appear less often overall" within this window
-        for d in nxt:
-            due_hits[int(d)] += 1
-
-    # typical overlap: take the two most common overlap counts
-    if overlap_counts:
-        oc = Counter(overlap_counts)
-        typical = [k for k, _ in oc.most_common(2)]
-    else:
-        typical = [1, 2]
-
-    # structure weights: normalize counts into weights; favor common structures
-    total = sum(struct_counts.values()) or 1
-    weights = {k: v / total for k, v in struct_counts.items()}
-
-    mu = float(sum(sums) / len(sums)) if sums else 22.5
-    var = float(sum((x - mu) ** 2 for x in sums) / max(1, (len(sums) - 1))) if len(sums) > 1 else 30.0
-    sd = math.sqrt(var) if var > 0 else 5.0
-
-    # crude due-bias digits: digits with lower hit frequency become "due-biased"
-    if due_hits:
-        min_hits = min(due_hits.values())
-        due_bias = sorted([d for d in range(10) if due_hits[d] <= min_hits + 1])
-    else:
-        due_bias = [0, 1, 2, 3]
-
-    return LearnedTendencies(
-        hot_digits=hot,
-        cold_digits=cold,
-        due_bias_digits=due_bias,
-        typical_seed_overlap=typical,
-        structure_weights=weights,
-        sum_mean=mu,
-        sum_sd=sd,
-    )
-
-
-def candidate_score(box: str, seed: str, grid_digits: Set[int], tend: LearnedTendencies) -> float:
-    ds = [int(c) for c in box]
-    counts = Counter(ds)
-    unique = len(counts)
-    s_overlap = len(set(seed) & set(box))
-    ssum = sum(ds)
-
-    score = 0.0
-
-    # 1) Grid inclusion boosts
-    grid_hits = sum(1 for d in ds if d in grid_digits)
-    score += 0.6 * grid_hits
-
-    # 2) Seed overlap preference
-    score += 1.2 if s_overlap in set(tend.typical_seed_overlap) else 0.0
-    score += 0.25 * s_overlap
-
-    # 3) Hot/cold presence (soft)
-    score += 0.35 * sum(1 for d in ds if d in tend.hot_digits)
-    score += 0.20 * sum(1 for d in ds if d in tend.cold_digits)
-    score += 0.10 * sum(1 for d in ds if d in tend.due_bias_digits)
-
-    # 4) Structure likelihood
-    struct = structure_of(ds)
-    score += 2.0 * float(tend.structure_weights.get(struct, 0.0))
-
-    # 5) Sum proximity (Gaussian-ish)
-    z = abs(ssum - tend.sum_mean) / max(1e-9, tend.sum_sd)
-    score += max(0.0, 1.0 - 0.25 * z)
-
-    # 6) Mild penalty for extreme repetition
-    if unique <= 2:
-        score -= 0.8
-    if unique == 1:
-        score -= 1.5
-
-    return float(score)
-
-
-def rank_candidates(boxes: List[str], seed: str, tend: LearnedTendencies) -> List[Tuple[str, float]]:
-    grid = make_grid_sets(seed)
-    grid_digits = set(grid["seed"]) | set(grid["+1"]) | set(grid["-1"]) | set(grid["mirror"])
-    scored = [(b, candidate_score(b, seed, grid_digits, tend)) for b in boxes]
-    # stable tie-break by numeric value
-    scored.sort(key=lambda x: (-x[1], x[0]))
-    return scored
-
-
-# -------------------------
-# Dynamic Percentile Zones (winner-heavy bins)
-# -------------------------
-
-
-def percentile_bin(idx: int, n: int, bin_size: int = 5) -> int:
-    if n <= 0:
-        return 0
-    pct = (idx / max(1, (n - 1))) * 100.0
-    return int(pct // bin_size) * bin_size  # 0,5,10,...
-
-
-def compute_winner_heavy_bins(
-    ranked_lists: List[List[str]],
-    winners: List[str],
-    bin_size: int = 5,
-    keep_adjacent: bool = True,
-) -> Set[int]:
-    """Return set of percentile bins (0..95) that contain at least one winner."""
-    heavy = set()
-    for ranked, win in zip(ranked_lists, winners):
-        if not ranked:
-            continue
-        win_box = "".join(sorted(win))
-        try:
-            idx = ranked.index(win_box)
-        except ValueError:
-            continue
-        b = percentile_bin(idx, len(ranked), bin_size=bin_size)
-        heavy.add(b)
-        if keep_adjacent:
-            heavy.add(max(0, b - bin_size))
-            heavy.add(min(100 - bin_size, b + bin_size))
-    return heavy
-
-
-def apply_percentile_bins(ranked: List[Tuple[str, float]], bins: Set[int], bin_size: int = 5) -> List[Tuple[str, float]]:
-    n = len(ranked)
-    kept = []
-    for i, (b, sc) in enumerate(ranked):
-        pb = percentile_bin(i, n, bin_size=bin_size)
-        if pb in bins:
-            kept.append((b, sc))
-    return kept
-
-
-# -------------------------
-# Loser List context + expression resolver (ported)
-# -------------------------
-
-
-LETTERS = list("ABCDEFGHIJ")
-
-
-def heat_order(rows10: List[List[str]]) -> List[str]:
-    c = Counter(d for r in rows10 for d in r)
-    for d in DIGITS:
-        c.setdefault(d, 0)
-    return sorted(DIGITS, key=lambda d: (-c[d], d))
-
-
-def rank_of_digit(order: List[str]) -> Dict[str, int]:
-    return {d: i + 1 for i, d in enumerate(order)}
-
-
-def neighbors(letter: str, span: int = 1) -> List[str]:
-    i = LETTERS.index(letter)
-    lo, hi = max(0, i - span), min(9, i + span)
-    return LETTERS[lo:hi + 1]
-
-
-def digits_for_letters_currentmap(letters: Set[str], digit_current_letters: Dict[str, str]) -> List[str]:
-    return [d for d in DIGITS if digit_current_letters.get(d) in letters]
-
-
-def compute_maps(last13: List[str]) -> Tuple[Dict, Dict]:
-    rows = [list(s) for s in last13]
-    prev10, curr10 = rows[1:11], rows[0:10]
-    order_prev = heat_order(prev10)
-    order_curr = heat_order(curr10)
-
-    def pack(order, rows10):
-        cnt = Counter(d for r in rows10 for d in r)
-        for d in DIGITS:
-            cnt.setdefault(d, 0)
-        rank = rank_of_digit(order)
-        d2L = {d: LETTERS[rank[d] - 1] for d in DIGITS}
-        return dict(order=order, rank=rank, counts=cnt, digit_letters=d2L)
-
-    return pack(order_prev, prev10), pack(order_curr, curr10)
-
-
-def loser_list_ctx(last13_mr_to_oldest: List[str], last20_mr_to_oldest: Optional[List[str]] = None) -> Dict:
-    if len(last13_mr_to_oldest) < 13:
-        raise ValueError("Need at least 13 draws for Loser List context")
-
-    rows = [list(s) for s in last13_mr_to_oldest]
-    info_prev, info_curr = compute_maps(last13_mr_to_oldest)
-
-    seed_digits_s = rows[0]
-    prev_digits_s = rows[1]
-    prev2_digits_s = rows[2] if len(rows) > 2 else []
-
-    digit_prev_letters = info_prev["digit_letters"]
-    digit_curr_letters = info_curr["digit_letters"]
-
-    prev_core_letters = sorted({digit_prev_letters[d] for d in seed_digits_s}, key=lambda L: LETTERS.index(L))
-
-    ring_letters = set()
-    for L in prev_core_letters:
-        ring_letters.update(neighbors(L, 1))
-    ring_digits = digits_for_letters_currentmap(ring_letters, digit_curr_letters)
-
-    loser_7_9 = info_curr["order"][-3:]
-    curr_core_letters = sorted({digit_curr_letters[d] for d in seed_digits_s}, key=lambda L: LETTERS.index(L))
-    new_core_digits = digits_for_letters_currentmap(set(curr_core_letters), digit_curr_letters)
-    cooled_digits = [d for d in DIGITS if info_curr["rank"][d] > info_prev["rank"][d]]
-    hot7_last10 = info_curr["order"][:7]
-
-    prev_mirror_digits = sorted({str(MIRROR[int(d)]) for d in prev_digits_s}, key=int)
-    union_last2 = sorted(set(prev_digits_s) | set(prev2_digits_s), key=int)
-    due2 = sorted(set(DIGITS) - set(prev_digits_s) - set(prev2_digits_s), key=int)
-
-    prev_core_currentmap_digits = digits_for_letters_currentmap(set(prev_core_letters), digit_curr_letters)
-    edge_AC = digits_for_letters_currentmap(set("ABC"), digit_curr_letters)
-    edge_HJ = digits_for_letters_currentmap(set("HIJ"), digit_curr_letters)
-
-    seed_sum = sum(int(x) for x in seed_digits_s)
-    prev_sum = sum(int(x) for x in prev_digits_s)
-
-    core_size = len(prev_core_letters)
-    core_size_flags = {
-        "core_size_eq_2": core_size == 2,
-        "core_size_eq_5": core_size == 5,
-        "core_size_in_2_5": core_size in {2, 5},
-        "core_size_in_235": core_size in {2, 3, 5},
-    }
-
-    seedp1 = sorted({str((int(d) + 1) % 10) for d in seed_digits_s}, key=int)
-    counts_last2 = Counter(prev_digits_s + prev2_digits_s)
-    for d in DIGITS:
-        counts_last2.setdefault(d, 0)
-    carry2_order = sorted(DIGITS, key=lambda d: (-counts_last2[d], int(d)))
-    carry2 = carry2_order[:2]
-    union2 = sorted(set(carry2) | set(seedp1), key=int)
-
-    seed_pos = [seed_digits_s[i] for i in range(5)]
-    p1_pos = [str((int(x) + 1) % 10) for x in seed_pos]
-    union_digits = sorted(set(seed_pos) | set(p1_pos), key=int)
-
-    ctx = dict(
-        seed_digits=seed_digits_s,
-        prev_digits=prev_digits_s,
-        prev2_digits=prev2_digits_s,
-        prev_mirror_digits=prev_mirror_digits,
-        union_last2=union_last2,
-        due_last2=due2,
-
-        digit_prev_letters=digit_prev_letters,
-        digit_current_letters=digit_curr_letters,
-        prev_core_letters=prev_core_letters,
-        curr_core_letters=curr_core_letters,
-        prev_core_currentmap_digits=prev_core_currentmap_digits,
-
-        ring_digits=ring_digits,
-        new_core_digits=new_core_digits,
-        cooled_digits=cooled_digits,
-        loser_7_9=loser_7_9,
-        hot7_last10=hot7_last10,
-        edge_AC=edge_AC,
-        edge_HJ=edge_HJ,
-        seed_sum=seed_sum,
-        prev_sum=prev_sum,
-        core_size_flags=core_size_flags,
-        seedp1=seedp1,
-        seed_plus1=seedp1,
-        seed_plus_1=seedp1,
-        carry2=carry2,
-        carry_top2=carry2,
-        union2=union2,
-        UNION2=union2,
-        seed_pos=seed_pos,
-        p1_pos=p1_pos,
-        union_digits=union_digits,
-        UNION_DIGITS=union_digits,
-        current_map_order="".join(info_curr["order"]),
-        previous_map_order="".join(info_prev["order"]),
-        current_counts=info_curr["counts"],
-        previous_counts=info_prev["counts"],
-        current_rank=info_curr["rank"],
-        previous_rank=info_prev["rank"],
-    )
-
-    # hot7_last20 if provided
-    if last20_mr_to_oldest and len(last20_mr_to_oldest) >= 20:
-        c = Counter(d for s in last20_mr_to_oldest[:20] for d in s)
-        for d in DIGITS:
-            c.setdefault(d, 0)
-        hot7_20 = [d for d, _ in c.most_common(7)]
-        ctx["hot7_last20"] = hot7_20
-    else:
-        ctx["hot7_last20"] = []
-
-    # transitions used by some loserlist filters (placeholders in that csv)
-    # We define them dynamically from letter transitions between prev_core and curr_core.
-    # F→I means letters in ['F','G','H','I']
-    fi_letters = set(["F", "G", "H", "I"])
-    gi_letters = set(["G", "H", "I"])
-    ctx["trans_FI"] = digits_for_letters_currentmap(fi_letters, digit_curr_letters)
-    ctx["trans_GI"] = digits_for_letters_currentmap(gi_letters, digit_curr_letters)
-
-    return ctx
-
-
-def normalize_expr(expr: str) -> str:
-    x = _normalize_quotes(expr or "").strip()
-    x = x.replace('!==', '!=')
-    x = x.replace('≤', '<=').replace('≥', '>=')
-    return x
-
-
-def resolve_loserlist_expression(expr: str, ctx: Dict) -> str:
-    """Port of LoserList resolver: converts membership to int-safe sets."""
-    x = normalize_expr(expr)
-
-    list_vars = {
-        "cooled_digits": ctx["cooled_digits"],
-        "new_core_digits": ctx["new_core_digits"],
-        "loser_7_9": ctx["loser_7_9"],
-        "ring_digits": ctx["ring_digits"],
-        "hot7_last10": ctx["hot7_last10"],
-        "hot7_last20": ctx.get("hot7_last20", []),
-        "seed_digits": ctx["seed_digits"],
-        "prev_digits": ctx["prev_digits"],
-        "prev_mirror_digits": ctx["prev_mirror_digits"],
-        "union_last2": ctx["union_last2"],
-        "due_last2": ctx["due_last2"],
-        "prev_core_currentmap_digits": ctx["prev_core_currentmap_digits"],
-        "edge_AC": ctx["edge_AC"],
-        "edge_HJ": ctx["edge_HJ"],
-        "trans_FI": ctx.get("trans_FI", []),
-        "trans_GI": ctx.get("trans_GI", []),
-
-        # positional shorthands
-        "s1": [ctx["seed_pos"][0]], "S1": [ctx["seed_pos"][0]],
-        "s2": [ctx["seed_pos"][1]], "S2": [ctx["seed_pos"][1]],
-        "s3": [ctx["seed_pos"][2]], "S3": [ctx["seed_pos"][2]],
-        "s4": [ctx["seed_pos"][3]], "S4": [ctx["seed_pos"][3]],
-        "s5": [ctx["seed_pos"][4]], "S5": [ctx["seed_pos"][4]],
-
-        "p1": ctx.get("seedp1", []), "P1": ctx.get("seedp1", []),
-        "p2": [ctx["p1_pos"][1]], "P2": [ctx["p1_pos"][1]],
-        "p3": [ctx["p1_pos"][2]], "P3": [ctx["p1_pos"][2]],
-        "p4": [ctx["p1_pos"][3]], "P4": [ctx["p1_pos"][3]],
-        "p5": [ctx["p1_pos"][4]], "P5": [ctx["p1_pos"][4]],
-        "seedp1": ctx.get("seedp1", []), "SEEDP1": ctx.get("seedp1", []),
-
-        "c1": ctx.get("carry2", []), "C1": ctx.get("carry2", []),
-        "c2": ctx.get("carry2", []), "C2": ctx.get("carry2", []),
-        "u1": ctx.get("union2", []), "U1": ctx.get("union2", []),
-        "u2": ctx.get("union2", []), "U2": ctx.get("union2", []),
-        "u3": ctx.get("union2", []), "U3": ctx.get("union2", []),
-        "u4": ctx.get("union2", []), "U4": ctx.get("union2", []),
-        "u5": ctx.get("union2", []), "U5": ctx.get("union2", []),
-        "u6": ctx.get("union2", []), "U6": ctx.get("union2", []),
-        "u7": ctx.get("union2", []), "U7": ctx.get("union2", []),
-        "union2": ctx.get("union2", []), "UNION2": ctx.get("union2", []),
-        "union_digits": ctx.get("union_digits", []),
-        "UNION_DIGITS": ctx.get("UNION_DIGITS", []),
-    }
-
-    def set_lit(xs: List[str]) -> str:
-        return "{" + ",".join(str(int(d)) for d in xs) + "}"
-
-    def _flatten_name_list(inner: str) -> str:
-        parts = [p.strip() for p in inner.split(",") if p.strip()]
-        flat, seen = [], set()
-        for p in parts:
-            if (len(p) >= 3) and (p[0] == p[-1]) and (p[0] in "'\""):
-                val = p[1:-1].strip()
-                if len(val) == 1 and val.isdigit() and val not in seen:
-                    seen.add(val)
-                    flat.append(val)
-                continue
-            if len(p) == 1 and p.isdigit():
-                if p not in seen:
-                    seen.add(p)
-                    flat.append(p)
-                continue
-            if p in list_vars:
-                for d in list_vars[p]:
-                    if d not in seen:
-                        seen.add(d)
-                        flat.append(d)
-                continue
-        return set_lit(flat)
-
-    # Replace tuple/bracket lists first
-    x = re.sub(r"\bnot\s+in\s*\(([^)]+)\)", lambda m: " not in " + _flatten_name_list(m.group(1)), x)
-    x = re.sub(r"\bin\s*\(([^)]+)\)", lambda m: " in " + _flatten_name_list(m.group(1)), x)
-    x = re.sub(r"\bnot\s+in\s*\[([^\]]+)\]", lambda m: " not in " + _flatten_name_list(m.group(1)), x)
-    x = re.sub(r"\bin\s*\[([^\]]+)\]", lambda m: " in " + _flatten_name_list(m.group(1)), x)
-
-    for name, arr in list_vars.items():
-        lit = set_lit(arr)
-        x = re.sub(rf"\bin\s+{re.escape(name)}\b", " in " + lit, x)
-        x = re.sub(rf"\bnot\s+in\s+{re.escape(name)}\b", " not in " + lit, x)
-        x = re.sub(rf"\bin\s*\(\s*{re.escape(name)}\s*\)", " in " + lit, x)
-        x = re.sub(rf"\bnot\s+in\s*\(\s*{re.escape(name)}\s*\)", " not in " + lit, x)
-
-    # generator-preserving int(d) casting for membership
-    x = re.sub(r"(\bif\s+)d(\s+(?:not\s+)?in\s+)", r"\1int(d)\2", x)
-    x = re.sub(r"\bsum\(\s*d\s+in\s+", "sum(int(d) in ", x)
-
-    # fix broken sums that lost generator
-    def _ensure_gen(m):
-        inner = m.group(1)
-        return f"sum(int(d) in {inner} for d in combo_digits)"
-
-    x = re.sub(r"\bsum\(\s*int\(d\)\s+(?:not\s+)?in\s*([^)]+)\)", _ensure_gen, x)
-    x = re.sub(r"\bsum\(\s*d\s+(?:not\s+)?in\s*([^)]+)\)", _ensure_gen, x)
-    x = re.sub(r"\bsum\(\s*1\s*for\s+in\s+combo_digits", "sum(1 for d in combo_digits", x)
-
-    # letter membership literals
-    def letter_contains(txt: str, varname: str, letters: Set[str]) -> str:
-        p = re.compile(r"'([A-J])'\s+in\s+" + re.escape(varname))
-        return p.sub(lambda mm: "True" if mm.group(1) in letters else "False", txt)
-
-    x = letter_contains(x, "prev_core_letters", set(ctx["prev_core_letters"]))
-    x = letter_contains(x, "core_letters", set(ctx["curr_core_letters"]))
-
-    # scalars
-    x = re.sub(r"\bseed_sum\b", str(ctx.get("seed_sum", 0)), x)
-    x = re.sub(r"\bprev_sum\b", str(ctx.get("prev_sum", 0)), x)
-    for key, val in (ctx.get("core_size_flags") or {}).items():
-        x = re.sub(rf"\b{re.escape(key)}\b", "True" if val else "False", x)
-
-    return x
-
-
-# -------------------------
-# Filter loading: LoserList CSV-like TXT + Batch10 CSV
-# -------------------------
-
-
-@dataclass(init=False)
-class FilterDef:
-    """Filter definition.
-
-    Backwards-compatible with older filter CSV/TXT exports.
-    Some files use column name `enabled`, while the app uses `enabled_default`.
-    This constructor accepts either keyword to avoid Streamlit Cloud crashes.
-    """
-
-    fid: str
-    name: str
-    enabled_default: bool
-    applicable_if: str
-    expression: str
-    source: str
-
-    def __init__(
-        self,
-        fid: str,
-        name: str,
-        enabled_default: bool = True,
-        applicable_if: str = "",
-        expression: str = "",
-        source: str = "",
-        # Back-compat alias:
-        enabled: bool | None = None,
-        **_ignored: Any,
-    ) -> None:
-        if enabled is not None:
-            enabled_default = enabled
-        self.fid = fid
-        self.name = name
-        self.enabled_default = bool(enabled_default)
-        self.applicable_if = applicable_if or ""
-        self.expression = expression or ""
-        self.source = source or ""
-
-
-def _robust_read_filter_table(text: str, source: str) -> pd.DataFrame:
-    """Parse filter CSV/TXT robustly.
-
-    The Batch10 and LoserList exports sometimes contain commas inside expressions or minor
-    column-count inconsistencies. Streamlit Cloud's pandas C-engine is strict and will
-    raise tokenizing errors.
-
-    Strategy:
-    - Use Python's csv.reader (handles quoted commas).
-    - For rows with too many columns: merge overflow into the last column.
-    - For rows with too few columns: pad empties.
-    - Ensure core columns exist: id/name/enabled/applicable_if/expression.
-    """
-    import csv
-
-    f = io.StringIO(text)
-    reader = csv.reader(f, delimiter=",", quotechar='"', escapechar='\\')
-    rows = list(reader)
-    if not rows:
-        return pd.DataFrame(columns=["id", "name", "enabled", "applicable_if", "expression"])
-
-    header = rows[0]
-
-    # Normalize header length (prefer 15 like the python filter tester)
-    target_cols = max(len(header), 15)
-    if len(header) < target_cols:
-        header = header + [f"Unnamed: {i}" for i in range(len(header), target_cols)]
-    elif len(header) > target_cols:
-        header = header[: target_cols - 1] + [",".join(header[target_cols - 1 :])]
-
-    data = []
-    for ridx, row in enumerate(rows[1:], start=2):
-        if not row or all(str(x).strip() == "" for x in row):
-            continue
-        if len(row) < len(header):
-            row = row + [""] * (len(header) - len(row))
-        elif len(row) > len(header):
-            row = row[: len(header) - 1] + [",".join(row[len(header) - 1 :])]
-        data.append(row[: len(header)])
-
-    df = pd.DataFrame(data, columns=header).fillna("")
-
-    # Normalize column names
-    cols_lower = {c: str(c).strip().lower() for c in df.columns}
-    df = df.rename(columns=cols_lower)
-
-    # If core columns are missing, assume first 5 columns map to core
-    core = ["id", "name", "enabled", "applicable_if", "expression"]
-    missing = [c for c in core if c not in df.columns]
-    if missing:
-        # rename first 5 columns to core, keep the rest
-        cols = list(df.columns)
-        for i, c in enumerate(core):
-            if i < len(cols):
-                cols[i] = c
-        df.columns = cols
-
-    # Ensure core columns exist
-    for c in core:
-        if c not in df.columns:
-            df[c] = ""
-
-    return df
-
-
-def load_filter_csv_text(text: str, source: str) -> List[FilterDef]:
-    """Load filters from CSV/TXT.
-
-    Accepts:
-    - The 15-column python-filter-tester CSV format
-    - A minimal 5-column filter export
-
-    Always returns FilterDef rows with id/name/enabled/applicable_if/expression.
-    """
-    df = _robust_read_filter_table(text, source)
-
-    out: List[FilterDef] = []
-    for _, r in df.iterrows():
-        fid = str(r.get("id", "")).strip()
-        if not fid or fid.lower() == "id":
-            continue
-        name = str(r.get("name", "")).strip() or fid
-        enabled_raw = str(r.get("enabled", "TRUE")).strip().upper()
-        enabled = enabled_raw in ("TRUE", "1", "YES", "Y")
-        applicable_if = str(r.get("applicable_if", "")).strip()
-        expr = str(r.get("expression", "")).strip()
-        if not expr:
-            continue
-        out.append(FilterDef(fid=fid, name=name, enabled_default=enabled, applicable_if=applicable_if, expression=expr, source=source))
-
-    return out
-
-def dedupe_filters(filters: List[FilterDef]) -> List[FilterDef]:
-    """Remove redundant filters by normalized expression + applicable_if."""
-    seen = {}
-    out = []
-    for f in filters:
-        key = (re.sub(r"\s+", " ", f.applicable_if.strip()), re.sub(r"\s+", " ", f.expression.strip()))
-        if key in seen:
-            continue
-        seen[key] = f.fid
-        out.append(f)
-    return out
-
-
-
+# - Accepts BOTH .txt and .csv inputs.
+# - TXT parsing is resilient to: tabs, multiple spaces, commas, Fireball/Wild Ball trailing text.
+# - Playable list upload is OPTIONAL (marks PlayableByUser=Yes/No; never filters rows).
+
+from __future__ import annotations
+
+import io
+import math
+import re
 from dataclasses import dataclass
+from datetime import date, datetime
+from itertools import permutations
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-@dataclass
-class FailedFilterEval:
-    id: str
-    name: str
-    expression: str
-    error_type: str
-    error_message: str
-    missing_vars: str
+import numpy as np
+import pandas as pd
+import streamlit as st
 
+# -----------------------------
+# Config
+# -----------------------------
 
-class FailureTracker:
-    def __init__(self) -> None:
-        self.items: list[FailedFilterEval] = []
+st.set_page_config(page_title="Pick 4 3389/3889/3899 — Master Ranking + Straights", layout="wide")
 
-    def has_any(self) -> bool:
-        """Return True if any filter evaluation failures were recorded."""
-        return bool(self.items)
+FAMILY_KEYS = {
+    "3389": "3389",
+    "3889": "3889",
+    "3899": "3899",
+}
+FAMILY_SET = set(FAMILY_KEYS.keys())
 
-    def add(self, *, fid: str, name: str, expression: str, err: Exception) -> None:
-        missing = ""
-        try:
-            msg = str(err)
-            m = re.search(r"name '([^']+)' is not defined", msg)
-            if m:
-                missing = m.group(1)
-        except Exception:
-            missing = ""
-
-        self.items.append(
-            FailedFilterEval(
-                id=fid,
-                name=name,
-                expression=expression,
-                error_type=type(err).__name__,
-                error_message=str(err),
-                missing_vars=missing,
-            )
-        )
-
-    def to_dataframe(self):
-        import pandas as pd
-        return pd.DataFrame([
-            {
-                "id": x.id,
-                "name": x.name,
-                "expression": x.expression,
-                "error_type": x.error_type,
-                "error_message": x.error_message,
-                "missing_vars": x.missing_vars,
-            }
-            for x in self.items
-        ])
+DIGIT_RE = re.compile(r"\d")
 
 
+# -----------------------------
+# Utilities
+# -----------------------------
 
-def sanitize_expr(expr: str) -> str:
-    """Fix a couple common CSV-expression typos that trigger Python SyntaxWarning spam.
 
-    Example: 'combo_sum <13and ...'  -> 'combo_sum <13 and ...'
-    """
-    if expr is None:
-        return ""
-    s = str(expr)
-    # Strip stray tag tokens like '0PWK' that can leak into the expression field
-    s = re.sub(r"\b\d+PWK\b", "", s)
-    # Insert missing space between a number and a boolean keyword (and/or/not/in/is)
-    s = re.sub(r"(\d)(and|or|not|in|is)\b", r"\1 \2", s)
+def _safe_decode(uploaded) -> str:
+    """Read a Streamlit UploadedFile as text."""
+    raw = uploaded.getvalue()
+    # Try UTF-8 first; fall back to latin-1 to avoid hard failures.
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("latin-1", errors="replace")
+
+
+def normalize_state(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"\s+", " ", s)
     return s
 
-def safe_eval(expr: str, env: Dict, *, filt: Dict | None = None, tracker: FailureTracker | None = None) -> bool:
-    """Evaluate boolean expression with a restricted global namespace.
 
-    Fail-safe behavior: any exception returns False (so the filter does NOT eliminate),
-    but we *record* the failure so it can be fixed.
+def normalize_game(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def extract_4digit_result(s: str) -> Optional[str]:
+    """Extract a 4-digit result from a messy field.
+
+    Handles patterns like:
+      - 3-9-3-8
+      - 3938
+      - 3-9-3-8, Fireball: 9
+      - ... Wild Ball: 2
+
+    Returns a 4-char string or None.
     """
+    if s is None:
+        return None
+    txt = str(s).strip()
+    if not txt:
+        return None
+
+    # Common: digits separated by dashes/spaces: "3-9-3-8"
+    digits = DIGIT_RE.findall(txt)
+    if len(digits) < 4:
+        return None
+
+    # IMPORTANT: We want the FIRST 4 digits describing the result, not trailing fireball.
+    # Many lines append Fireball/Wild Ball digits after the result, so we take the first 4.
+    return "".join(digits[:4])
+
+
+def box_key(num4: str) -> str:
+    return "".join(sorted(num4))
+
+
+def unique_perms(num4: str) -> List[str]:
+    return sorted({"".join(p) for p in permutations(list(num4), 4)})
+
+
+def parse_date_any(s: str) -> Optional[pd.Timestamp]:
+    """Parse date from common formats in your TXT/CSV."""
+    if s is None:
+        return None
+    txt = str(s).strip()
+    if not txt:
+        return None
+
+    # Typical lines: "Sat, Dec 27, 2025" or "2025/12/26"
+    # Let pandas try first.
     try:
-        expr = sanitize_expr(expr)
-        return bool(eval(expr, {"__builtins__": {}}, env))
-    except Exception as e:
-        if tracker is not None and filt is not None:
-            try:
-                tracker.add(
-                    fid=str(filt.get("id", "")),
-                    name=str(filt.get("name", "")),
-                    expression=str(expr),
-                    err=e,
-                )
-            except Exception:
-                pass
-        return False
+        dt = pd.to_datetime(txt, errors="coerce", infer_datetime_format=True)
+        if pd.isna(dt):
+            return None
+        return dt
+    except Exception:
+        return None
 
 
-def build_filter_env(seed: str, prev: str, prev2: str, combo_box: str, extra_ctx: Optional[Dict] = None) -> Dict:
-    seed_digits = [int(d) for d in seed]
-    prev_digits = [int(d) for d in prev]
-    prev2_digits = [int(d) for d in prev2]
-    combo_digits = [int(d) for d in combo_box]
+# -----------------------------
+# Parsing (HITS + STREAM files)
+# -----------------------------
 
-    # hot/cold/due (basic)
-    hot, cold = hot_cold_sets([seed, prev, prev2], hot_k=3, cold_k=3)
-    due = due_last2(prev, prev2)
-
-    seed_counts = Counter(seed_digits)
-    combo_sum = sum(combo_digits)
-    prev_pattern = tuple([sum_category(sum(prev2_digits)), "Even" if sum(prev2_digits) % 2 == 0 else "Odd",
-                          sum_category(sum(prev_digits)), "Even" if sum(prev_digits) % 2 == 0 else "Odd",
-                          sum_category(sum(seed_digits)), "Even" if sum(seed_digits) % 2 == 0 else "Odd"])
-
-    env = {
-        "seed_value": int(seed),
-        "seed_sum": sum(seed_digits),
-        "prev_seed_sum": sum(prev_digits),
-        "prev_prev_seed_sum": sum(prev2_digits),
-        "seed_digits": seed_digits,
-        "prev_seed_digits": prev_digits,
-        "prev_prev_seed_digits": prev2_digits,
-        "prev_pattern": prev_pattern,
-        "hot_digits": hot,
-        "cold_digits": cold,
-        "due_digits": due,
-        "seed_counts": seed_counts,
-        "combo_digits": combo_digits,
-        "combo_sum": combo_sum,
-        "combo_sum_cat": sum_category(combo_sum),
-        "seed_vtracs": set(V_TRAC_GROUPS[d] for d in seed_digits),
-        "combo_vtracs": set(V_TRAC_GROUPS[d] for d in combo_digits),
-        "common_to_both": set(seed_digits) & set(prev_digits),
-        "mirror": MIRROR,
-        "MIRROR": MIRROR,
-        "V_TRAC": V_TRAC_GROUPS,
-        "V_TRAC_GROUPS": V_TRAC_GROUPS,
-        "vtrac": V_TRAC_GROUPS,
-    }
-    if extra_ctx:
-        env.update(extra_ctx)
-    return env
+REQUIRED_COLS = ["date", "state", "game", "result"]
 
 
-def evaluate_filters_on_pool(
-    pool: List[str],
-    filters: List[FilterDef],
-    seed: str,
-    prev: str,
-    prev2: str,
-    loser_ctx: Optional[Dict] = None,
-) -> Tuple[List[str], List[Tuple[str, int, int]], FailureTracker]:
-    """Apply enabled filters in order.
+def _standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    mapping = {}
+    for c in df.columns:
+        lc = str(c).strip().lower()
+        mapping[c] = lc
+    df = df.rename(columns=mapping)
 
-    Returns:
-      - survivors: list of box strings
-      - log: (filter_id, before_count, after_count)
-      - failure_tracker: captures any filter eval exceptions (failsafe stays ON)
+    # Common aliases
+    if "drawdate" in df.columns and "date" not in df.columns:
+        df = df.rename(columns={"drawdate": "date"})
+    if "draw" in df.columns and "date" not in df.columns:
+        df = df.rename(columns={"draw": "date"})
+    if "province" in df.columns and "state" not in df.columns:
+        df = df.rename(columns={"province": "state"})
+
+    return df
+
+
+def _parse_csv_flexible(text: str) -> Optional[pd.DataFrame]:
+    """Attempt CSV/TSV parsing using pandas.
+
+    NOTE: many files that look like "text" are actually TSV where the
+    date contains commas (e.g., "Fri, Dec 26, 2025"). If we let pandas
+    sniff delimiters, it can wrongly choose comma and shred the date.
+    So we try tab-first when tabs are present.
     """
-    survivors = pool
-    log: List[Tuple[str, int, int]] = []
-    ft = FailureTracker()
 
-    for f in filters:
-        before = len(survivors)
-        if before == 0:
+    # Grab the first non-empty line for delimiter heuristics
+    first_line = ""
+    for ln in text.splitlines():
+        if ln.strip():
+            first_line = ln
             break
-        if not f.enabled_default:
+
+    # Build a small list of parsing attempts, ordered by likelihood.
+    attempts: List[Dict[str, object]] = []
+    if "\t" in first_line and first_line.count("\t") >= 2:
+        attempts.append(dict(sep="\t", engine="python"))
+    # Common cases
+    attempts.extend([
+        dict(sep=None, engine="python"),
+        dict(sep=",", engine="python"),
+        dict(sep=";", engine="python"),
+    ])
+
+    df = None
+    for kwargs in attempts:
+        try:
+            df = pd.read_csv(io.StringIO(text), **kwargs)
+            break
+        except Exception:
+            df = None
             continue
 
-        # Resolve expressions
-        app_if = f.applicable_if or "True"
-        expr = f.expression or "False"
-        if f.source == "loserlist":
-            if loser_ctx is None:
-                # cannot apply LL filters without ctx
-                continue
-            app_if = resolve_loserlist_expression(app_if, loser_ctx)
-            expr = resolve_loserlist_expression(expr, loser_ctx)
+    if df is None:
+        return None
+    df = _standardize_columns(df)
 
-        kept: List[str] = []
+    # If it already contains required columns, great.
+    if all(c in df.columns for c in REQUIRED_COLS):
+        return df
 
-        for box in survivors:
-            extra = loser_ctx if (f.source == "loserlist" and loser_ctx is not None) else {}
-            env = build_filter_env(seed, prev, prev2, box, extra_ctx=extra)
+    # Sometimes the file is delimiter-separated but without header.
+    # Try heuristic: 4 columns in order date, state, game, result.
+    if df.shape[1] >= 4 and "date" not in df.columns:
+        cols = list(df.columns)
+        df2 = df.rename(columns={cols[0]: "date", cols[1]: "state", cols[2]: "game", cols[3]: "result"})
+        if all(c in df2.columns for c in REQUIRED_COLS):
+            # Validate that at least one date is parseable; otherwise this
+            # is likely a bad delimiter (e.g., comma split inside the date).
+            sample = df2["date"].head(8).astype(str).tolist()
+            if any(parse_date_any(x) is not None for x in sample):
+                return df2
 
-            # applicable_if: if it errors, treat as NOT applicable (failsafe) but record it
-            if not safe_eval(app_if, env, filt=f, tracker=ft):
-                kept.append(box)
-                continue
-
-            # library meaning: expression is ELIMINATE-if
-            if safe_eval(expr, env, filt=f, tracker=ft):
-                # eliminated
-                pass
-            else:
-                kept.append(box)
-
-        survivors = kept
-        after = len(survivors)
-        log.append((f.fid, before, after))
-
-    return survivors, log, ft
+    return None
 
 
+def _parse_txt_lines(text: str) -> pd.DataFrame:
+    """Parse TXT where each line is like:
 
-# -------------------------
-# Walk-forward calibration
-# -------------------------
+    Sat, Dec 27, 2025\tTexas\tDaily 4 Night\t3-9-3-8, Fireball: 9
 
-
-@dataclass
-class CalibrationResult:
-    learning_window: int
-    validation_window: int
-    topN: int
-    bins: Set[int]
-    bin_size: int
-    retain_rate: float
-    avg_rank_of_winner: float
-    details: pd.DataFrame
-
-
-def build_transitions(df_mr: pd.DataFrame) -> List[Tuple[str, str]]:
-    # df_mr is MR -> Oldest; transition is (seed=draw_i, next=draw_{i-1})? Actually seed is previous draw
-    # We define seed as draw at index i (more recent), winner as index i-1 (older)??
-    # For seed->next winner in chronological forward time, we use (older_seed -> newer_winner).
-    # Since df is MR->Oldest, chronological forward is reverse. So:
-    # oldest ... newer ... most recent
-    results = df_mr["result"].tolist()
-    chron = list(reversed(results))  # Oldest -> Most recent
-    out = []
-    for i in range(len(chron) - 1):
-        out.append((chron[i], chron[i + 1]))
-    return out
-
-
-def calibrate_windows(
-    df_mr: pd.DataFrame,
-    candidate_topN: int,
-    learn_options: List[int],
-    val_options: List[int],
-    gen_mode: str,
-    gen_cap: int,
-    bin_size: int = 5,
-) -> CalibrationResult:
-    transitions = build_transitions(df_mr)
-    n_trans = len(transitions)
-    if n_trans < 150:
-        raise ValueError(f"Not enough history transitions for calibration (need ~150+, have {n_trans}).")
-
-    best: Optional[CalibrationResult] = None
-
-    for lw in learn_options:
-        for vw in val_options:
-            if lw + vw + 5 > n_trans:
-                continue
-
-            # Use the most recent chunk for validation
-            val_start = n_trans - vw
-            learn_start = max(0, val_start - lw)
-            learn_trans = transitions[learn_start:val_start]
-            val_trans = transitions[val_start:]
-
-            # Recent draws for hot/cold context: last 20 winners in MR space
-            recent_draws = df_mr.iloc[:20]["result"].tolist()
-            tend = learn_tendencies_from_transitions(learn_trans, recent_draws)
-
-            ranked_lists = []
-            winners = []
-            ranks = []
-            kept_counts = []
-
-            # Build ranked list for each validation transition
-            for seed, winner in val_trans:
-                boxes = generate_candidate_boxes(seed, mode=gen_mode, cap=gen_cap)
-                ranked_scored = rank_candidates(boxes, seed, tend)
-                ranked_scored = ranked_scored[:candidate_topN]
-                ranked = [b for b, _ in ranked_scored]
-
-                ranked_lists.append(ranked)
-                winners.append(winner)
-
-                wbox = "".join(sorted(winner))
-                if wbox in ranked:
-                    ranks.append(ranked.index(wbox) + 1)
-                else:
-                    ranks.append(None)
-                kept_counts.append(len(ranked))
-
-            heavy_bins = compute_winner_heavy_bins(ranked_lists, winners, bin_size=bin_size, keep_adjacent=True)
-
-            hits = 0
-            used = 0
-            after_bins_ranks = []
-            for ranked, winner in zip(ranked_lists, winners):
-                if not ranked:
-                    continue
-                used += 1
-                # simulate percentile bin trimming
-                n = len(ranked)
-                kept = []
-                for i, b in enumerate(ranked):
-                    pb = percentile_bin(i, n, bin_size=bin_size)
-                    if pb in heavy_bins:
-                        kept.append(b)
-                wbox = "".join(sorted(winner))
-                if wbox in kept:
-                    hits += 1
-                    after_bins_ranks.append(kept.index(wbox) + 1)
-
-            retain_rate = hits / max(1, used)
-            avg_rank = float(sum(after_bins_ranks) / len(after_bins_ranks)) if after_bins_ranks else float("inf")
-
-            details = pd.DataFrame({
-                "seed": [s for s, _ in val_trans],
-                "winner": [w for _, w in val_trans],
-                "winner_in_topN": [r is not None for r in ranks],
-                "rank_in_topN": ranks,
-            })
-
-            cand = CalibrationResult(
-                learning_window=lw,
-                validation_window=vw,
-                topN=candidate_topN,
-                bins=heavy_bins,
-                bin_size=bin_size,
-                retain_rate=retain_rate,
-                avg_rank_of_winner=avg_rank,
-                details=details,
-            )
-
-            if best is None:
-                best = cand
-            else:
-                # Priority: higher retain_rate; tie-break: lower avg winner rank
-                if (cand.retain_rate > best.retain_rate) or (
-                    abs(cand.retain_rate - best.retain_rate) < 1e-9 and cand.avg_rank_of_winner < best.avg_rank_of_winner
-                ):
-                    best = cand
-
-    if best is None:
-        raise ValueError("Could not calibrate with the provided history (try more history or smaller windows).")
-    return best
-
-
-# -------------------------
-# Filter ranking / selection (dynamic)
-# -------------------------
-
-
-@dataclass
-class FilterPerf:
-    fid: str
-    name: str
-    source: str
-    apply_count: int
-    keep_rate: float
-    avg_elim_rate: float
-
-
-def rank_filters_walkforward(
-    df_mr: pd.DataFrame,
-    filters: List[FilterDef],
-    cal: CalibrationResult,
-    gen_mode: str,
-    gen_cap: int,
-    target_after_bins: int,
-    safety_keep_rate: float = 0.75,
-) -> List[FilterPerf]:
-    """Score each filter on recent walk-forward: keep-rate of winners and elim-rate on pools."""
-    transitions = build_transitions(df_mr)
-    n_trans = len(transitions)
-
-    vw = cal.validation_window
-    lw = cal.learning_window
-
-    val_start = n_trans - vw
-    learn_start = max(0, val_start - lw)
-    learn_trans = transitions[learn_start:val_start]
-    val_trans = transitions[val_start:]
-
-    recent_draws = df_mr.iloc[:20]["result"].tolist()
-    tend = learn_tendencies_from_transitions(learn_trans, recent_draws)
-
-    # Precompute pools per validation seed
-    pools = []
-    ctxs = []
-    winners = []
-
-    # Need loserlist context uses last13 MR->Oldest relative to each seed
-    # We'll build MR-anchored slices by finding seed in df chron.
-    # Simplification: use overall MR slices around the seed when possible.
-
-    # Build chronological list for locating
-    chron = list(reversed(df_mr["result"].tolist()))
-    idx_map = {r: i for i, r in enumerate(chron)}  # last occurrence; ok for typical use
-
-    for seed, winner in val_trans:
-        boxes = generate_candidate_boxes(seed, mode=gen_mode, cap=gen_cap)
-        ranked_scored = rank_candidates(boxes, seed, tend)[:cal.topN]
-        ranked_scored = apply_percentile_bins(ranked_scored, cal.bins, bin_size=cal.bin_size)
-        ranked_scored = ranked_scored[:target_after_bins]
-        pool = [b for b, _ in ranked_scored]
-        pools.append(pool)
-        winners.append(winner)
-
-        # prev/prev2 for env: use seed's previous draws chronologically
-        i = idx_map.get(seed)
-        if i is None or i < 2:
-            prev = seed
-            prev2 = seed
-            last13 = [seed] * 13
-            last20 = [seed] * 20
-        else:
-            prev = chron[i - 1]
-            prev2 = chron[i - 2]
-            # last13 MR->Oldest relative to "seed" as MR
-            slice_rev = list(reversed(chron[max(0, i - 12): i + 1]))
-            last13 = slice_rev + [slice_rev[-1]] * (13 - len(slice_rev))
-            slice20 = list(reversed(chron[max(0, i - 19): i + 1]))
-            last20 = slice20 + [slice20[-1]] * (20 - len(slice20))
-
-        ll_ctx = None
-        try:
-            ll_ctx = loser_list_ctx(last13, last20)
-        except Exception:
-            ll_ctx = None
-        ctxs.append((seed, prev, prev2, ll_ctx))
-
-    perfs = []
-
-    for f in filters:
-        applies = 0
-        winner_kept = 0
-        elim_rates = []
-
-        for pool, (seed, prev, prev2, ll_ctx), winner in zip(pools, ctxs, winners):
-            if not pool:
-                continue
-            if f.source == "loserlist" and ll_ctx is None:
-                continue
-
-            # resolve expr for this run
-            app_if = f.applicable_if or "True"
-            expr = f.expression or "False"
-            if f.source == "loserlist":
-                app_if = resolve_loserlist_expression(app_if, ll_ctx)
-                expr = resolve_loserlist_expression(expr, ll_ctx)
-
-            # apply filter once on the pool
-            before = len(pool)
-            kept = []
-            eliminated = 0
-            wbox = "".join(sorted(winner))
-            w_in_before = wbox in pool
-            w_in_after = False
-
-            for box in pool:
-                env = build_filter_env(seed, prev, prev2, box, extra_ctx=(ll_ctx or {}))
-                if not safe_eval(app_if, env):
-                    kept.append(box)
-                    continue
-                applies += 1
-                if safe_eval(expr, env):
-                    eliminated += 1
-                else:
-                    kept.append(box)
-
-            after = len(kept)
-            if before > 0:
-                elim_rates.append(eliminated / before)
-
-            if w_in_before:
-                if wbox in kept:
-                    w_in_after = True
-                    winner_kept += 1
-                else:
-                    winner_kept += 0
-
-        # keep_rate measured only on cases where winner was present pre-filter in pool
-        # approximate by dividing by count of validation draws with winner in pool
-        denom = 0
-        for pool, (_, _, _, _), winner in zip(pools, ctxs, winners):
-            if "".join(sorted(winner)) in pool:
-                denom += 1
-        keep_rate = (winner_kept / denom) if denom else 1.0
-        avg_elim = float(sum(elim_rates) / len(elim_rates)) if elim_rates else 0.0
-
-        perfs.append(FilterPerf(
-            fid=f.fid,
-            name=f.name,
-            source=f.source,
-            apply_count=applies,
-            keep_rate=float(keep_rate),
-            avg_elim_rate=float(avg_elim),
-        ))
-
-    # Rank: safest first, then more aggressive
-    safe = [p for p in perfs if p.keep_rate >= safety_keep_rate]
-    safe.sort(key=lambda p: (-p.keep_rate, -p.avg_elim_rate, p.fid))
-    return safe
-
-
-# -------------------------
-# Straight ordering
-# -------------------------
-
-
-def straight_rankings_from_box(box: str, tend: LearnedTendencies, seed: str) -> List[str]:
-    """Return a ranked list of straight permutations from a box.
-
-    Heuristic:
-      - Order digits by: (is_seed_digit desc, is_hot desc, count desc, digit asc)
-      - Then generate unique permutations and score each by positional hotness.
+    or with multiple spaces.
     """
-    digits = [int(x) for x in box]
-    counts = Counter(digits)
-    seed_set = set(int(x) for x in seed)
-    hot_set = set(tend.hot_digits)
+    rows: List[Dict[str, object]] = []
 
-    # generate unique permutations
-    perms = set(product(digits, repeat=5))
-    # That explodes; instead generate permutations via backtracking respecting counts
-    uniques = []
+    # Heuristic keywords that typically mark where the **Game** field begins
+    # when a line is separated by single spaces (no tabs / no multi-spaces).
+    # This helps parse lines like:
+    # "Fri, Dec 26, 2025 Texas Daily 4 Night 3-9-3-8, Fireball: 9"
+    GAME_KEYWORDS = {
+        "pick", "daily", "cash", "numbers", "dc-4", "pega", "midday", "evening", "night", "day",
+        "am", "pm", "a.m.", "p.m.", "10pm", "11pm", "7:50pm", "1:50pm",
+    }
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
 
-    def backtrack(path, remaining: Counter):
-        if len(path) == 5:
-            uniques.append(tuple(path))
-            return
-        for d in sorted(remaining.keys()):
-            if remaining[d] <= 0:
+        # Skip obvious headers
+        low = line.lower()
+        if low.startswith("date") and ("state" in low and "game" in low):
+            continue
+
+        # Prefer tab split, else 2+ spaces, else a keyword-based single-space fallback
+        parts: List[str]
+        if "\t" in line:
+            parts = [p.strip() for p in line.split("\t") if p.strip()]
+        else:
+            parts = [p.strip() for p in re.split(r"\s{2,}", line) if p.strip()]
+            if len(parts) < 4:
+                # Some lines are comma-separated in the date segment.
+                # Try to capture date up to year, then remaining fields.
+                m = re.match(r"^(.*?\b\d{4}\b)\s+(.*)$", line)
+                if m:
+                    date_part = m.group(1).strip()
+                    rest = m.group(2).strip()
+                    rest_parts = [p.strip() for p in re.split(r"\s{2,}", rest) if p.strip()]
+                    parts = [date_part] + rest_parts
+
+        if len(parts) < 4:
+            # Keyword-based parse for single-space-separated lines.
+            # Strategy:
+            # 1) Grab date (up to year)
+            # 2) Find the 4-digit result (with or without hyphens)
+            # 3) Remaining middle => "State Game"; split into state vs game by first game keyword
+            m = re.match(r"^(.*?\b\d{4}\b)\s+(.*)$", line)
+            if m:
+                date_part = m.group(1).strip()
+                rest = m.group(2).strip()
+
+                # Find first 4-digit pick4-like token in the rest (hyphenated or compact)
+                rm = re.search(r"(\d\s*[- ]\s*\d\s*[- ]\s*\d\s*[- ]\s*\d|\b\d{4}\b)", rest)
+                if rm:
+                    mid = rest[: rm.start()].strip()
+                    result_part = rest[rm.start():].strip()
+
+                    # Split mid into tokens
+                    toks = mid.split()
+                    if len(toks) >= 2:
+                        # Find first token that looks like a game keyword
+                        gi = None
+                        for i, t in enumerate(toks):
+                            if t.lower() in GAME_KEYWORDS or t.lower().startswith("dc-"):
+                                gi = i
+                                break
+                        if gi is not None and gi > 0:
+                            state = " ".join(toks[:gi]).strip()
+                            game = " ".join(toks[gi:]).strip()
+                            parts = [date_part, state, game, result_part]
+
+        if len(parts) < 4:
+            # As an absolute fallback, try comma split (rare)
+            parts = [p.strip() for p in line.split(",") if p.strip()]
+
+        if len(parts) < 4:
+            continue
+
+        dt = parse_date_any(parts[0])
+        if dt is None:
+            continue
+
+        state = parts[1]
+        game = parts[2]
+        result = parts[3]
+
+        rows.append({"date": dt, "state": state, "game": game, "result": result})
+
+    df = pd.DataFrame(rows)
+    return df
+
+
+def load_history(uploaded, filter_families: bool = True) -> pd.DataFrame:
+    """Load either CSV or TXT into a canonical df with required columns."""
+    if uploaded is None:
+        return pd.DataFrame(columns=REQUIRED_COLS)
+
+    name = (uploaded.name or "").lower()
+    text = _safe_decode(uploaded)
+
+    df: Optional[pd.DataFrame] = None
+    if name.endswith(".csv"):
+        df = _parse_csv_flexible(text)
+        if df is None:
+            # Sometimes CSVs are weird; try txt parser
+            df = _parse_txt_lines(text)
+    elif name.endswith(".txt"):
+        # Many of your "txt" files are actually tab-separated tables.
+        # Also: dates like "Fri, Dec 26, 2025" contain commas, so pandas'
+        # delimiter sniffing can mistakenly pick comma and shred the date.
+        # Prefer the robust line parser first.
+        df = _parse_txt_lines(text)
+        if df is None:
+            df = _parse_csv_flexible(text)
+    else:
+        # Unknown extension: try delimiter sniff then txt parser
+        df = _parse_csv_flexible(text)
+        if df is None:
+            df = _parse_txt_lines(text)
+
+    if df is None or df.empty:
+        return pd.DataFrame(columns=REQUIRED_COLS)
+
+    df = _standardize_columns(df)
+
+    # Keep only required columns (but tolerate extra)
+    for c in REQUIRED_COLS:
+        if c not in df.columns:
+            df[c] = None
+
+    # Normalize
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["state"] = df["state"].astype(str).map(normalize_state)
+    df["game"] = df["game"].astype(str).map(normalize_game)
+    df["result"] = df["result"].map(extract_4digit_result)
+
+    df = df.dropna(subset=["date", "state", "game", "result"]).copy()
+    df["result"] = df["result"].astype(str)
+    # Attach family key
+    df["box"] = df["result"].map(box_key)
+    df["family"] = df["box"].where(df["box"].isin(FAMILY_SET), other="")
+    if filter_families:
+        df = df[df["family"] != ""].copy()
+    df["family"] = df["family"].astype(str)
+
+    # Sort
+    df = df.sort_values(["state", "game", "date"]).reset_index(drop=True)
+    return df
+
+
+def load_playable_list(uploaded) -> pd.DataFrame:
+    """Load playable streams list. Accepts TXT or CSV.
+
+    Must include State and Game either as header or as 2 columns.
+    """
+    if uploaded is None:
+        return pd.DataFrame(columns=["state", "game"])
+
+    text = _safe_decode(uploaded)
+    name = (uploaded.name or "").lower()
+
+    df: Optional[pd.DataFrame] = None
+    if name.endswith(".csv"):
+        try:
+            df = pd.read_csv(io.StringIO(text))
+        except Exception:
+            df = None
+    if df is None:
+        # TXT or fallback: parse as simple lines
+        rows = []
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line:
                 continue
-            remaining[d] -= 1
-            path.append(d)
-            backtrack(path, remaining)
-            path.pop()
-            remaining[d] += 1
+            low = line.lower()
+            if low.startswith("state") and "game" in low:
+                continue
+            if "\t" in line:
+                parts = [p.strip() for p in line.split("\t") if p.strip()]
+            else:
+                # try comma, else 2+ spaces
+                if "," in line:
+                    parts = [p.strip() for p in line.split(",") if p.strip()]
+                else:
+                    parts = [p.strip() for p in re.split(r"\s{2,}", line) if p.strip()]
+            if len(parts) < 2:
+                continue
+            rows.append({"state": normalize_state(parts[0]), "game": normalize_game(parts[1])})
+        df = pd.DataFrame(rows)
 
-    backtrack([], Counter(digits))
+    df = _standardize_columns(df)
+    # Accept either state/game or State/Game
+    if "state" not in df.columns or "game" not in df.columns:
+        # If exactly 2 cols, map them
+        if df.shape[1] >= 2:
+            cols = list(df.columns)
+            df = df.rename(columns={cols[0]: "state", cols[1]: "game"})
 
-    # score straights
-    scored = []
-    for tup in uniques:
-        sc = 0.0
-        for i, d in enumerate(tup):
-            sc += 0.4 if d in seed_set else 0.0
-            sc += 0.25 if d in hot_set else 0.0
-            sc += 0.05 * counts[d]
-            sc += 0.01 * (9 - abs(4 - i))  # mild center preference
-        scored.append(("".join(str(x) for x in tup), sc))
-    scored.sort(key=lambda x: (-x[1], x[0]))
-    return [s for s, _ in scored]
+    if "state" not in df.columns or "game" not in df.columns:
+        return pd.DataFrame(columns=["state", "game"])
+
+    df = df[["state", "game"]].copy()
+    df["state"] = df["state"].astype(str).map(normalize_state)
+    df["game"] = df["game"].astype(str).map(normalize_game)
+    df = df.dropna().drop_duplicates().reset_index(drop=True)
+    return df
 
 
-# -------------------------
+# -----------------------------
+# Scoring (Master Ranking)
+# -----------------------------
+
+
+def exp_decay(days: float, half_life: float) -> float:
+    if half_life <= 0:
+        return 0.0
+    return float(math.exp(-math.log(2) * (days / half_life)))
+
+
+def safe_div(a: float, b: float) -> float:
+    return float(a / b) if b else 0.0
+
+
+@dataclass
+class StreamStats:
+    state: str
+    game: str
+    hits: int
+    last_hit_date: Optional[pd.Timestamp]
+    days_since_last_hit: Optional[int]
+    hit_rate: float
+    consistency: float
+    reliability: float
+    share_3389: float
+    share_3889: float
+    share_3899: float
+    overdue_percentile: float
+    due_tempered: float
+    schedule_boost: float
+    expected_gap_days: Optional[float]
+    predicted_next_hit: Optional[pd.Timestamp]
+
+
+def compute_schedule_boost(dates: Sequence[pd.Timestamp],
+                           target: pd.Timestamp,
+                           alpha: float,
+                           combine_mode: str) -> float:
+    if len(dates) == 0:
+        return 0.0
+
+    # weekday: 0=Mon..6=Sun
+    wds = [int(d.weekday()) for d in dates]
+    months = [int(d.month) for d in dates]
+
+    total = len(dates)
+    wd_counts = np.bincount(wds, minlength=7)
+    mo_counts = np.bincount(months, minlength=13)  # 1..12 used
+
+    wd_prob = safe_div(wd_counts[target.weekday()] + alpha, total + alpha * 7)
+    mo_prob = safe_div(mo_counts[target.month] + alpha, total + alpha * 12)
+
+    if combine_mode.lower().startswith("mult"):
+        return float(wd_prob * mo_prob)
+    # default: average
+    return float((wd_prob + mo_prob) / 2.0)
+
+
+def compute_stream_stats(df: pd.DataFrame,
+                         analysis_start: pd.Timestamp,
+                         analysis_end: pd.Timestamp,
+                         schedule_alpha: float,
+                         schedule_combine_mode: str) -> pd.DataFrame:
+    """Compute stats per (state, game) using ONLY the hits history."""
+
+    groups = df.groupby(["state", "game"], sort=False)
+    rows = []
+
+    total_days = max(1, int((analysis_end.date() - analysis_start.date()).days) + 1)
+
+    for (state, game), g in groups:
+        g = g.sort_values("date")
+        hits = int(len(g))
+
+        last_hit_date = g["date"].max() if hits else None
+        days_since = None
+        if last_hit_date is not None:
+            days_since = int((analysis_end.normalize() - last_hit_date.normalize()).days)
+
+        # HitRate: hits per day in window
+        hit_rate = safe_div(hits, total_days)
+
+        # Consistency: fraction of months in window with >=1 hit
+        if hits:
+            months_with = g["date"].dt.to_period("M").nunique()
+        else:
+            months_with = 0
+        months_total = max(1, (analysis_end.to_period("M") - analysis_start.to_period("M")).n + 1)
+        consistency = safe_div(months_with, months_total)
+
+        # Reliability: soft boost for sample size
+        reliability = math.log1p(hits)
+
+        # Family shares
+        counts_by_family = g["family"].value_counts().to_dict()
+        share_3389 = safe_div(counts_by_family.get("3389", 0), hits)
+        share_3889 = safe_div(counts_by_family.get("3889", 0), hits)
+        share_3899 = safe_div(counts_by_family.get("3899", 0), hits)
+
+        # Gap-based overdue and expected next hit
+        dates = g["date"].sort_values().dt.normalize().tolist()
+        gaps = []
+        for i in range(1, len(dates)):
+            gap = int((dates[i] - dates[i - 1]).days)
+            if gap > 0:
+                gaps.append(gap)
+
+        overdue_pct = 0.0
+        expected_gap = None
+        predicted_next = None
+        due_tempered = 0.0
+
+        if gaps and days_since is not None:
+            gaps_arr = np.array(gaps, dtype=float)
+            expected_gap = float(np.mean(gaps_arr))
+
+            # OverduePercentile: how deep are we relative to historical gaps
+            overdue_pct = float(np.mean(gaps_arr <= float(days_since)))
+
+            # Temper by proximity to median-ish gaps (avoid over-weighting extreme droughts)
+            med = float(np.median(gaps_arr))
+            prox = math.exp(-abs(float(days_since) - med) / (med + 1.0))
+            due_tempered = float(overdue_pct * (0.25 + 0.75 * prox))
+
+            # Predicted next hit date
+            if last_hit_date is not None:
+                predicted_next = last_hit_date.normalize() + pd.Timedelta(days=int(round(expected_gap)))
+
+        schedule_boost = compute_schedule_boost(dates, analysis_end.normalize(), alpha=schedule_alpha,
+                                                combine_mode=schedule_combine_mode)
+
+        rows.append({
+            "State": state,
+            "Game": game,
+            "Hits": hits,
+            "LastHitDate": last_hit_date.date().isoformat() if last_hit_date is not None else "",
+            "DaysSinceLastHit": days_since if days_since is not None else "",
+            "HitRate": hit_rate,
+            "Consistency": consistency,
+            "Reliability": reliability,
+            "Share_3389": share_3389,
+            "Share_3889": share_3889,
+            "Share_3899": share_3899,
+            "OverduePercentile": overdue_pct,
+            "DueTempered": due_tempered,
+            "ScheduleBoost": schedule_boost,
+            "ExpectedGapDays": expected_gap if expected_gap is not None else "",
+            "PredictedNextHitDate": predicted_next.date().isoformat() if predicted_next is not None else "",
+        })
+
+    return pd.DataFrame(rows)
+
+
+def score_master_table(stats: pd.DataFrame,
+                       w_hit: float,
+                       w_due: float,
+                       w_sched: float,
+                       w_cons: float,
+                       w_rel: float) -> pd.DataFrame:
+    if stats.empty:
+        return stats
+
+    df = stats.copy()
+
+    # Normalize components to comparable 0..1 range
+    def minmax(col: str) -> pd.Series:
+        x = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+        mn, mx = float(x.min()), float(x.max())
+        if mx <= mn:
+            return pd.Series([0.0] * len(x), index=x.index)
+        return (x - mn) / (mx - mn)
+
+    hit_n = minmax("HitRate")
+    due_n = minmax("DueTempered")
+    sched_n = minmax("ScheduleBoost")
+    cons_n = minmax("Consistency")
+    rel_n = minmax("Reliability")
+
+    score = (
+        w_hit * hit_n
+        + w_due * due_n
+        + w_sched * sched_n
+        + w_cons * cons_n
+        + w_rel * rel_n
+    )
+
+    df["Score"] = score
+    df = df.sort_values(["Score", "Hits"], ascending=[False, False]).reset_index(drop=True)
+    df.insert(0, "Rank", np.arange(1, len(df) + 1))
+    return df
+
+
+# -----------------------------
+# Straights learner (per stream)
+# -----------------------------
+
+
+def straight_ranking_for_stream(df_stream: pd.DataFrame,
+                               state: str,
+                               game: str,
+                               family: str,
+                               alpha: float = 1.0,
+                               half_life: int = 120,
+                               recency_mix: float = 0.30,
+                               asof: Optional[pd.Timestamp] = None) -> Tuple[pd.DataFrame, Dict]:
+    """Return a 12-straight ranking table for one (state, game, family).
+
+    If the selected stream has 0 hits for this family, we fall back to a global
+    distribution (all uploaded stream rows) for that family. If that is also 0,
+    we use a uniform distribution.
+
+    Returns: (table_df, info_dict)
+    """
+    perms = generate_unique_perms(family)
+
+    if asof is None:
+        asof = pd.Timestamp(df_stream["date"].max()).normalize() if not df_stream.empty else pd.Timestamp.today().normalize()
+    else:
+        asof = pd.Timestamp(asof).normalize()
+
+    # Evidence: state/game specific hits for this family
+    g = df_stream[(df_stream["state"] == state) & (df_stream["game"] == game) & (df_stream["family"] == family)].copy()
+    used_mode = "state_game"
+
+    # Global fallback evidence: any stream hits for this family
+    g_global = df_stream[df_stream["family"] == family].copy() if not df_stream.empty else pd.DataFrame(columns=df_stream.columns if not df_stream.empty else [])
+
+    if g.empty:
+        if not g_global.empty:
+            g = g_global
+            used_mode = "global_fallback"
+        else:
+            used_mode = "uniform"
+
+    # Counts
+    counts = {p: 0 for p in perms}
+    last_seen_map: dict[str, pd.Timestamp] = {}
+
+    if used_mode != "uniform":
+        # result is already canonical as 4 digits (e.g., '9383')
+        for p, sub in g.groupby("result"):
+            if p in counts:
+                counts[p] = int(len(sub))
+                last_seen_map[p] = pd.Timestamp(sub["date"].max()).normalize()
+
+    total = sum(counts.values())
+
+    # Freq prob (Laplace)
+    denom = (total + alpha * len(perms))
+    freq_prob = {p: (counts[p] + alpha) / denom for p in perms}
+
+    # Recency weight per permutation
+    rec_w = {}
+    for p in perms:
+        if p in last_seen_map:
+            ds = (asof - last_seen_map[p]).days
+            rec_w[p] = recency_weight(ds, half_life)
+        else:
+            rec_w[p] = 0.0
+
+    # Normalize recency weights to look like a probability distribution
+    rec_sum = sum(rec_w.values())
+    if rec_sum > 0:
+        rec_prob = {p: rec_w[p] / rec_sum for p in perms}
+    else:
+        rec_prob = {p: 1.0 / len(perms) for p in perms}
+
+    # Final blend
+    out_rows = []
+    for p in perms:
+        score = (1.0 - recency_mix) * freq_prob[p] + recency_mix * rec_prob[p]
+        out_rows.append({
+            "Straight": p,
+            "Count": counts[p],
+            "Prob": float(score),
+        })
+
+    out = pd.DataFrame(out_rows)
+    out = out.sort_values(["Prob", "Count", "Straight"], ascending=[False, False, True]).reset_index(drop=True)
+    out.insert(0, "Rank", range(1, len(out) + 1))
+
+    info = {
+        "mode": used_mode,
+        "state_game_hits": int(df_stream[(df_stream["state"] == state) & (df_stream["game"] == game) & (df_stream["family"] == family)].shape[0]) if not df_stream.empty else 0,
+        "global_hits": int(g_global.shape[0]) if not df_stream.empty else 0,
+        "asof": asof,
+        "family": family,
+        "state": state,
+        "game": game,
+    }
+
+    return out, info
+
+
+
+# -----------------------------
 # UI
-# -------------------------
+# -----------------------------
 
-
-st.title("Pick 5 — SeedGrid + Walk-Forward Auto Calibration + Dynamic Filters")
+st.title("Pick 4 3389 / 3889 / 3899 — Master Ranking + 12-Straights Learner")
 
 with st.sidebar:
-    st.header("History")
-    up = st.file_uploader("Upload Pick 5 history (TXT)", type=["txt", "csv"])
-    stream_name = st.text_input("Stream label (for saving defaults)", value="STATE_STREAM")
+    st.header("Inputs")
+    st.caption("HITS = 5-year hits list across all states/games. STREAM = per-state/game 24-month history for straight ordering.")
 
-    st.divider()
-    st.header("Auto settings")
-    topN_default = st.slider("Initial Top-N after ranking", min_value=200, max_value=2000, value=500, step=50)
-    target_final = st.slider("Target final pool size", min_value=25, max_value=800, value=150, step=25)
-    gen_cap = st.slider("Generation cap (box candidates)", min_value=2000, max_value=60000, value=20000, step=1000)
-    gen_mode = st.selectbox(
-        "Generation mode",
-        ["two_pairs_plus_non_grid", "two_pairs_plus_grid", "mirror_pair_mix"],
+    hits_file = st.file_uploader(
+        "Upload 5-year HIT history (TXT or CSV)",
+        type=["txt", "csv"],
+        help="TXT can be tab-separated or space-separated. Must contain Date, State, Game, Result. Fireball/Wild Ball is okay.",
+    )
+
+    st.markdown("---")
+    st.subheader("As-Of scoring date")
+    asof_date = st.date_input("As-Of Date", value=None)
+    assume_no_hits_after = st.checkbox(
+        "Assume there were NO hits after the last file date through As-Of Date",
+        value=True,
+        help="If checked, days-since-last-hit is computed up to As-Of Date even when your file stops earlier.",
+    )
+
+    st.markdown("---")
+    st.subheader("Optional: Playable list")
+    playable_file = st.file_uploader(
+        "Upload a Playable list (TXT or CSV with columns State,Game) to MARK playable streams (no filtering)",
+        type=["txt", "csv"],
+        help="If TXT: each line should be State<TAB>Game or State,Game.",
+    )
+
+    st.markdown("---")
+    st.subheader("Model controls")
+    # Fixed weights (but we still expose them as read-only text + hidden slider option)
+    st.caption("Weights are fixed to your approved mix (you can change later if you want).")
+
+    schedule_alpha = st.slider(
+        "Schedule smoothing α (higher = weaker schedule boost / less overfit)",
+        min_value=0.0,
+        max_value=10.0,
+        value=2.0,
+        step=0.1,
+    )
+    schedule_mode = st.selectbox(
+        "ScheduleBoost combine mode",
+        options=["Multiply (weekday*month)", "Average (weekday+month)/2"],
         index=0,
-        help="Controls how candidate boxes are generated BEFORE ranking/percentiles."
     )
 
-    st.divider()
-    st.header("Calibration windows")
-    learn_opts = st.multiselect("Learning window candidates (transitions)", [120, 180, 240], default=[120, 180, 240])
-    val_opts = st.multiselect("Validation window candidates (transitions)", [60, 90, 120], default=[90])
-    bin_size = st.select_slider("Percentile bin size", options=[5, 10], value=5)
+    # Default fixed weights (match your on-screen mix style)
+    w_hit = 0.50
+    w_due = 0.30
+    w_sched = 0.10
+    w_cons = 0.08
+    w_rel = 0.02
 
-    st.divider()
-    st.header("Filter sources")
-    use_loser = st.checkbox("Include LoserList filters", value=True)
-    loserlist_uploader = st.file_uploader("Upload LoserList filters (CSV/TXT)", type=["txt","csv"], help="Use the exported loserlist filters file (CSV-format with id,name,expression...).")
-    use_batch10 = st.checkbox("Include Batch10 filters (first 780 rows)", value=True)
-    batch10_uploader = st.file_uploader("Upload Batch10 filters CSV", type=["csv"], help="Upload lottery_filters_batch10.csv (we only use rows 1-780 per your instruction).")
-    safety_keep_rate = st.slider("Min winner-keep rate to auto-apply filter", 0.50, 1.00, 0.75, 0.01)
+    st.markdown("**Fixed scoring weights**")
+    st.write(f"- {w_hit:.2f} HitRate")
+    st.write(f"- {w_due:.2f} OverduePercentile (tempered by GapProximity)")
+    st.write(f"- {w_sched:.2f} ScheduleBoost")
+    st.write(f"- {w_cons:.2f} Consistency")
+    st.write(f"- {w_rel:.2f} Reliability")
+
+    st.markdown("---")
+    st.subheader("Straights learning")
+    stream_files = st.file_uploader(
+        "Upload 24-month STREAM history file(s) (TXT or CSV)",
+        type=["txt", "csv"],
+        accept_multiple_files=True,
+        help="You can upload one per state/game, or many at once. Must contain Date, State, Game, Result.",
+    )
+
+    straight_half_life = st.slider("Recency half-life (days)", 1, 365, 120)
+    straight_alpha = st.slider("Smoothing alpha (Laplace)", 0.0, 5.0, 1.0, 0.05)
+    straight_mix = st.slider("Blend recency vs frequency (0=freq only, 1=recency only)", 0.0, 1.0, 0.30, 0.01)
 
 
-if not up:
-    st.info("Upload a Pick-5 history TXT to begin.")
+# ---------------
+# Load data
+# ---------------
+
+if hits_file is None:
+    st.info("Upload your 5-year HIT history to see the master ranking.")
     st.stop()
 
+hits_df = load_history(hits_file, filter_families=True)
 
-history_text = up.read().decode("utf-8", errors="ignore")
-
-try:
-    df = load_history_from_text(history_text)
-except Exception as e:
-    st.error(str(e))
+if hits_df.empty:
+    st.error("After parsing, the HITS file contains 0 rows matching families 3389/3889/3899.")
     st.stop()
 
-st.success(f"Loaded {len(df)} results.")
+file_start = hits_df["date"].min().normalize()
+file_end = hits_df["date"].max().normalize()
 
-colA, colB, colC = st.columns([1.2, 1, 1])
-with colA:
-    st.subheader("Most recent results")
-    st.dataframe(df[["date", "result"]].head(10), use_container_width=True)
-with colB:
-    most_recent = str(df.iloc[0]["result"])
-    st.subheader("Seed (most recent)")
-    st.code(most_recent)
-with colC:
-    st.subheader("Grid digits")
-    g = make_grid_sets(most_recent)
-    st.write({k: "".join(str(x) for x in v) for k, v in g.items()})
-
-
-# Load filters (prefer sidebar uploads; fall back to repo files if present)
-filters_all: List[FilterDef] = []
-
-# NOTE: Streamlit Cloud runs from the repo root, not /mnt/data.
-# These helper lookups try current working directory AND the script directory.
-from pathlib import Path as _Path
-
-_BASE_DIR = _Path(__file__).resolve().parent
-
-def _read_text_if_exists(candidates):
-    for name in candidates:
-        p = _Path(name)
-        if p.exists():
-            return p.read_text(encoding='utf-8', errors='ignore')
-        p = _BASE_DIR / name
-        if p.exists():
-            return p.read_text(encoding='utf-8', errors='ignore')
-    return None
-
-def _read_csv_if_exists(candidates):
-    for name in candidates:
-        p = _Path(name)
-        if p.exists():
-            return pd.read_csv(p, dtype=str).fillna("")
-        p = _BASE_DIR / name
-        if p.exists():
-            return pd.read_csv(p, dtype=str).fillna("")
-    return None
-
-if use_loser:
-    try:
-        if loserlist_uploader is not None:
-            loser_text = loserlist_uploader.read().decode("utf-8", errors="ignore")
-        else:
-            loser_text = _read_text_if_exists([
-                "loserlist_filters15_FIXED (5).csv",
-                "loserlist_filters15_FIXED.csv",
-                "loserlist_filters15.csv",
-                "loserlist filters15.txt",
-            ])
-        if loser_text:
-            loser_filters = load_filter_csv_text(loser_text, source="loserlist")
-            filters_all.extend(loser_filters)
-        else:
-            st.warning("Could not load LoserList filters: no file found (upload one in the sidebar, or commit loserlist_filters15_FIXED (5).csv to the repo).")
-    except Exception as e:
-        st.warning(f"Could not load LoserList filters: {e}")
-
-if use_batch10:
-    try:
-        if batch10_uploader is not None:
-            batch_df = pd.read_csv(batch10_uploader, dtype=str).fillna("")
-        else:
-            batch_df = _read_csv_if_exists([
-                "lottery_filters_batch10_NO_LOSERLIST.csv",
-                "lottery_filters_batch10.csv",
-                "lottery_filters_batch10 (61).csv",
-            ])
-        if batch_df is None:
-            st.warning("Could not load Batch10 filters: no file found (upload one in the sidebar, or commit lottery_filters_batch10_NO_LOSERLIST.csv to the repo).")
-        else:
-            # take only first 780 data rows (keeps runtime sane)
-            batch_df = batch_df.iloc[:780].copy()
-            buff = io.StringIO()
-            batch_df.to_csv(buff, index=False)
-            batch_filters = load_filter_csv_text(buff.getvalue(), source="batch10")
-            filters_all.extend(batch_filters)
-    except Exception as e:
-        st.warning(f"Could not load Batch10 filters: {e}")
-
-filters_all = dedupe_filters(filters_all)
-st.caption(f"Filters loaded (after dedupe): {len(filters_all)}")
-
-
-st.divider()
-st.subheader("Auto Calibration (Walk-forward)")
-
-# Auto-run calibration by default (so you don't have to remember steps).
-# You can still re-run it if you change settings.
-need_cal = "cal" not in st.session_state
-rerun = st.button("Re-run auto calibration", type="primary", help="Recompute best windows + winner-heavy percentile zones.")
-if need_cal or rerun:
-    with st.spinner("Running auto calibration (walk-forward)..."):
-        try:
-            cal = calibrate_windows(
-                df_mr=df,
-                candidate_topN=int(topN_default),
-                learn_options=sorted(set(learn_opts)) or [180],
-                val_options=sorted(set(val_opts)) or [90],
-                gen_mode=gen_mode,
-                gen_cap=int(gen_cap),
-                bin_size=int(bin_size),
-            )
-            st.session_state["cal"] = cal
-        except Exception as e:
-            st.error(str(e))
-            st.stop()
-
-cal: Optional[CalibrationResult] = st.session_state.get("cal")
-st.success(
-    f"Using calibration: learn={cal.learning_window}, validate={cal.validation_window}, "
-    f"retain={cal.retain_rate:.3f}, avg rank={cal.avg_rank_of_winner:.1f}"
-)
-st.write("Winner-heavy percentile bins kept:", sorted(cal.bins))
-with st.expander("Show recent calibration rows"):
-    st.dataframe(cal.details.tail(30), use_container_width=True)
-
-
-st.divider()
-st.subheader("Run prediction for the current seed")
-
-# Build learning tendencies using chosen learning window
-transitions = build_transitions(df)
-n_trans = len(transitions)
-vw = cal.validation_window
-lw = cal.learning_window
-val_start = n_trans - vw
-learn_start = max(0, val_start - lw)
-learn_trans = transitions[learn_start:val_start]
-recent_draws = df.iloc[:20]["result"].tolist()
-tend = learn_tendencies_from_transitions(learn_trans, recent_draws)
-
-seed = most_recent
-
-boxes = generate_candidate_boxes(seed, mode=gen_mode, cap=int(gen_cap))
-ranked_scored = rank_candidates(boxes, seed, tend)[:cal.topN]
-ranked_scored_bins = apply_percentile_bins(ranked_scored, cal.bins, bin_size=cal.bin_size)
-
-st.write(f"Generated boxes: {len(boxes)}")
-st.write(f"Top-N after ranking: {len(ranked_scored)}")
-st.write(f"After percentile-bin keep: {len(ranked_scored_bins)}")
-
-ranked_pool = [b for b, _ in ranked_scored_bins]
-ranked_pool = ranked_pool[: max(int(target_final) * 4, 450)]  # keep enough for filtering
-
-st.caption(f"Pool entering dynamic filter ranking: {len(ranked_pool)}")
-
-
-# Determine prev and prev2 from df (MR->Oldest)
-prev = df.iloc[1]["result"] if len(df) > 1 else seed
-prev2 = df.iloc[2]["result"] if len(df) > 2 else prev
-
-# Build loser ctx for current run
-last13 = df.iloc[:13]["result"].tolist()
-last20 = df.iloc[:20]["result"].tolist()
-ll_ctx = None
-try:
-    ll_ctx = loser_list_ctx(last13, last20)
-except Exception:
-    ll_ctx = None
-
-
-st.subheader("Dynamic filter ranking (walk-forward)")
-with st.spinner("Ranking filters on this history (walk-forward)..."):
-    ranked_filters = rank_filters_walkforward(
-        df_mr=df,
-        filters=filters_all,
-        cal=cal,
-        gen_mode=gen_mode,
-        gen_cap=int(gen_cap),
-        target_after_bins=max(int(target_final) * 4, 450),
-        safety_keep_rate=float(safety_keep_rate),
-    )
-
-records = [
-    {
-        "id": p.fid,
-        "name": p.name,
-        "source": p.source,
-        "winner_keep_rate": round(p.keep_rate, 3),
-        "avg_elim_rate": round(p.avg_elim_rate, 3),
-        "apply_count": p.apply_count,
-    }
-    for p in ranked_filters
-]
-
-df_perf = pd.DataFrame.from_records(records)
-if df_perf.empty:
-    df_perf = pd.DataFrame(columns=["id", "name", "source", "winner_keep_rate", "avg_elim_rate", "apply_count"])
-
-st.dataframe(df_perf.head(50), use_container_width=True)
-st.caption("Auto-apply order = safest → more aggressive (among those meeting keep-rate threshold)")
-
-
-st.subheader("Apply filters automatically to reach target")
-
-# NOTE: This auto-apply is only for *ranked* filters (safest → more aggressive).
-# Manual filters are never auto-applied.
-
-enable_auto = st.checkbox(
-    "Enable auto-apply (ranked) filters",
-    value=True,
-    help="If off, the pool stays at the percentile-bin keep result. Manual filters are always user-driven.",
-)
-
-apply_count = 0
-id_col = None
-to_apply_ids: set[str] = set()
-filters_to_apply: list[FilterDef] = []
-
-if enable_auto and len(ranked_filters) > 0 and not df_perf.empty:
-    apply_count = st.slider(
-        "Max filters to auto-apply",
-        0,
-        min(100, len(ranked_filters)),
-        min(25, len(ranked_filters)),
-    )
-
-    # Robustly pick the ID column
-    id_col = (
-        "id" if "id" in df_perf.columns else ("filter_id" if "filter_id" in df_perf.columns else None)
-    )
-    if id_col is not None and apply_count > 0:
-        to_apply_ids = set(df_perf.head(apply_count)[id_col].astype(str).tolist())
-
-    filters_to_apply = [f for f in filters_all if f.fid in to_apply_ids]
-
-    # Preserve the ranked order from df_perf
-    order_list = df_perf.head(apply_count)[id_col].astype(str).tolist() if id_col else []
-    order = {fid: i for i, fid in enumerate(order_list)}
-    filters_to_apply.sort(key=lambda f: order.get(f.fid, 999999))
-
-survivors, log, failure_tracker = evaluate_filters_on_pool(
-    pool=ranked_pool,
-    filters=filters_to_apply,
-    seed=seed,
-    prev=prev,
-    prev2=prev2,
-    loser_ctx=ll_ctx,
-)
-
-st.write(f"After auto filters: **{len(survivors)}**")
-
-log_df = pd.DataFrame(log, columns=["filter_id", "before", "after"])
-st.dataframe(log_df, use_container_width=True)
-
-# Show failed filters (failsafe kept, but nothing is silent)
-if failure_tracker.has_any():
-    st.warning(f"Filters failed (error → automatically returned False): {len(failure_tracker.items)}")
-    with st.expander("Show failed filters (fix these in the filter files)", expanded=False):
-        fail_df = failure_tracker.to_dataframe()
-        st.dataframe(fail_df, use_container_width=True)
-
-        st.download_button(
-            "Download failed filters report (csv)",
-            data=fail_df.to_csv(index=False),
-            file_name=f"failed_filters_{stream_name}.csv",
-        )
-
-        # TXT summary (copy/paste-friendly)
-        lines = []
-        for row in failure_tracker.items:
-            lines.append(f"{row.fid}: {row.name} → {row.error_type}: {row.message}")
-            if row.missing_vars:
-                lines.append(f"  missing_vars: {', '.join(row.missing_vars)}")
-            lines.append(f"  expr: {row.expression}")
-            lines.append("")
-        st.download_button(
-            "Download failed filters report (txt)",
-            data="\n".join(lines).strip() + "\n",
-            file_name=f"failed_filters_{stream_name}.txt",
-        )
-
-
-# --- Manual filter testing (one-by-one) ---
-st.subheader("Manual filter testing (one-by-one)")
-st.caption("Nothing in this section auto-applies. A filter only runs when you click Apply.")
-
-# Keep a stable pool across reruns
-if "manual_pool" not in st.session_state:
-    st.session_state.manual_pool = None
-if "manual_log" not in st.session_state:
-    st.session_state.manual_log = []
-if "manual_failed" not in st.session_state:
-    st.session_state.manual_failed = []
-if "manual_applied_ids" not in st.session_state:
-    st.session_state.manual_applied_ids = set()
-
-col_reset, col_keep = st.columns([1, 2])
-with col_reset:
-    if st.button("Reset manual pool to current auto-survivors"):
-        st.session_state.manual_pool = list(survivors)
-        st.session_state.manual_log = []
-        st.session_state.manual_failed = []
-        st.session_state.manual_applied_ids = set()
-with col_keep:
-    st.write("Manual pool is independent of the Final pool trim below. Use it for testing/what-if.")
-
-if st.session_state.manual_pool is None:
-    st.session_state.manual_pool = list(survivors)
-
-manual_pool = list(st.session_state.manual_pool)
-
-st.write(f"Manual pool size: **{len(manual_pool)}**")
-
-# Build dropdown of available filters
-applied_auto_ids = set(to_apply_ids) if isinstance(to_apply_ids, set) else set()
-blocked_ids = applied_auto_ids | set(st.session_state.manual_applied_ids)
-available = [f for f in filters_all if f.fid not in blocked_ids]
-
-if len(available) == 0:
-    st.info("No additional filters available (either none were loaded, or you've applied them all).")
+# Default As-Of = file end (or user override)
+if asof_date is None:
+    asof_ts = file_end
 else:
-    # Label includes source + name for clarity
-    def _label(f):
-        src = f.source if getattr(f, "source", None) else "?"
-        return f"{f.fid} | {src} | {f.name}"
+    asof_ts = pd.Timestamp(asof_date)
 
-    choice = st.selectbox(
-        "Pick a filter to apply to the manual pool",
-        options=available,
-        format_func=_label,
-        key="manual_filter_choice",
-    )
+analysis_end = asof_ts.normalize() if assume_no_hits_after else file_end
+analysis_start = file_start
 
-    c1, c2, c3 = st.columns([1, 1, 2])
-    with c1:
-        do_apply = st.button("Apply selected filter")
-    with c2:
-        do_undo = st.button("Undo last manual filter")
+combine_mode = "multiply" if schedule_mode.lower().startswith("multiply") else "average"
 
-    if do_undo and st.session_state.manual_log:
-        # Full undo means recomputing from survivors minus last applied
-        st.session_state.manual_applied_ids.remove(st.session_state.manual_log[-1][0])
-        st.session_state.manual_log = st.session_state.manual_log[:-1]
-        # Re-run remaining applied filters in order
-        pool = list(survivors)
-        for fid, _, _ in st.session_state.manual_log:
-            f = next((x for x in filters_all if x.fid == fid), None)
-            if f is None:
-                continue
-            pool, _, _ = evaluate_filters_on_pool(
-                pool=pool,
-                filters=[f],
-                seed=seed,
-                prev=prev,
-                prev2=prev2,
-                loser_ctx=ll_ctx,
-            )
-        st.session_state.manual_pool = pool
-        manual_pool = list(pool)
-
-    if do_apply and choice is not None:
-        before = len(manual_pool)
-        new_pool, one_log, one_fail = evaluate_filters_on_pool(
-            pool=manual_pool,
-            filters=[choice],
-            seed=seed,
-            prev=prev,
-            prev2=prev2,
-            loser_ctx=ll_ctx,
-        )
-        after = len(new_pool)
-        st.session_state.manual_pool = list(new_pool)
-        st.session_state.manual_applied_ids.add(choice.fid)
-        st.session_state.manual_log.append((choice.fid, before, after))
-
-        if one_fail.has_any():
-            # Keep a compact record for manual context
-            for row in one_fail.items:
-                st.session_state.manual_failed.append({
-                    "filter_id": row.fid,
-                    "name": row.name,
-                    "error_type": row.error_type,
-                    "message": row.message,
-                    "expression": row.expression,
-                })
-
-        st.success(f"Applied {choice.fid}: {before} → {after} (eliminated {before-after})")
-        manual_pool = list(st.session_state.manual_pool)
-
-    # Display manual log
-    if st.session_state.manual_log:
-        st.caption("Manual filter log")
-        mlog_df = pd.DataFrame(st.session_state.manual_log, columns=["filter_id", "before", "after"])
-        st.dataframe(mlog_df, use_container_width=True)
-
-        st.download_button(
-            "Download manual log (csv)",
-            data=mlog_df.to_csv(index=False),
-            file_name=f"manual_log_{stream_name}.csv",
-            mime="text/csv",
-        )
-
-    if st.session_state.manual_failed:
-        st.warning(f"Manual-run filters failed (returned False): {len(st.session_state.manual_failed)}")
-        with st.expander("Show manual-run failures", expanded=False):
-            mfail_df = pd.DataFrame(st.session_state.manual_failed)
-            st.dataframe(mfail_df, use_container_width=True)
-    # Manual pool export
-    st.download_button(
-        "Download current MANUAL pool (txt)",
-        data="\n".join(manual_pool) + "\n",
-        file_name=f"manual_pool_{stream_name}.txt",
-    )
-
-
-
-# Trim to target_final while keeping order by original ranking score
-rank_index = {b: i for i, (b, _) in enumerate(ranked_scored_bins)}
-survivors.sort(key=lambda b: rank_index.get(b, 10**9))
-final_pool = survivors[:int(target_final)]
-
-st.subheader("Final pool (box, ranked most-likely → least-likely)")
-
-final_df = pd.DataFrame({
-    "rank": list(range(1, len(final_pool) + 1)),
-    "box": final_pool,
-})
-st.dataframe(final_df, use_container_width=True)
-
-
-st.subheader("Straight recommendations (ranked)")
-
-straight_limit = st.slider("How many box combos to expand into straights", 1, len(final_pool), min(25, len(final_pool)))
-max_straights_per_box = st.slider("Max straights per box", 1, 120, 24)
-
-straight_rows = []
-for i, box in enumerate(final_pool[:straight_limit], start=1):
-    straights = straight_rankings_from_box(box, tend, seed)[:max_straights_per_box]
-    for j, s in enumerate(straights, start=1):
-        straight_rows.append({"box_rank": i, "straight_rank": j, "straight": s, "box": box})
-
-straight_df = pd.DataFrame(straight_rows)
-st.dataframe(straight_df, use_container_width=True)
-
-
-st.download_button(
-    "Download final BOX list (txt)",
-    data="\n".join(final_pool),
-    file_name=f"pick5_final_box_{stream_name}.txt",
+st.caption(
+    f"History USED: {analysis_start.date()} → {file_end.date()} (file end) | "
+    f"As-Of scoring date: {asof_ts.date()} | Analysis window end: {analysis_end.date()} | "
+    f"days_window={(analysis_end.date() - analysis_start.date()).days + 1} | "
+    f"streams found: {hits_df.groupby(['state','game']).ngroups}"
 )
 
+# Playable list
+playable_df = load_playable_list(playable_file) if playable_file is not None else pd.DataFrame(columns=["state", "game"])
+playable_set = set()
+if not playable_df.empty:
+    playable_set = set(zip(playable_df["state"], playable_df["game"]))
+
+# Compute per-stream stats + score
+stats_df = compute_stream_stats(
+    hits_df,
+    analysis_start=analysis_start,
+    analysis_end=analysis_end,
+    schedule_alpha=float(schedule_alpha),
+    schedule_combine_mode=combine_mode,
+)
+
+scored = score_master_table(
+    stats_df,
+    w_hit=w_hit,
+    w_due=w_due,
+    w_sched=w_sched,
+    w_cons=w_cons,
+    w_rel=w_rel,
+)
+
+if not scored.empty:
+    scored["PlayableByUser"] = np.where(
+        scored.apply(lambda r: (r["State"], r["Game"]) in playable_set, axis=1),
+        "Yes",
+        "No",
+    )
+
+# -----------------------------
+# Master ranking display
+# -----------------------------
+
+st.header("A) Master Ranking — All States / All Games (Most → Least Likely)")
+
+# Show a compact explanation
+with st.expander("What this score is doing (quick)", expanded=False):
+    st.markdown(
+        """
+- **HitRate**: streams that hit these families more often (in your file window) score higher.
+- **OverduePercentile (tempered)**: streams that are **"due"** based on their own historical *hit gaps* score higher.
+- **ScheduleBoost**: boosts streams that historically hit more often on the **same weekday/month** as the As-Of date.
+- **Consistency / Reliability**: small stabilizers so tiny samples don’t dominate.
+
+This is *not* using the winning 12/27 results directly — it is using hit-gap behavior learned from the history you uploaded.
+        """
+    )
+
+st.dataframe(scored, use_container_width=True, height=520)
+
+csv_bytes = scored.to_csv(index=False).encode("utf-8")
 st.download_button(
-    "Download straight recommendations (csv)",
-    data=straight_df.to_csv(index=False),
-    file_name=f"pick5_straights_{stream_name}.csv",
+    "Download master ranking CSV",
+    data=csv_bytes,
+    file_name="pk4_master_ranking_3389_3889_3899.csv",
+    mime="text/csv",
+)
+
+# -----------------------------
+# Straights learner display
+# -----------------------------
+
+st.header("B) Straight ordering learning (state-specific 12 straights per family)")
+
+if not stream_files:
+    st.info("Upload one or more 24-month STREAM history files (TXT or CSV) to rank straights per State/Game.")
+    st.stop()
+
+# Load and combine stream files
+stream_dfs = []
+for f in stream_files:
+    d = load_history(f, filter_families=False)
+    if not d.empty:
+        stream_dfs.append(d)
+
+if not stream_dfs:
+    st.error("After parsing, the STREAM file(s) contain 0 rows. Please check formatting.")
+    st.stop()
+
+stream_df = pd.concat(stream_dfs, ignore_index=True)
+stream_df = stream_df.sort_values(["state", "game", "date"]).reset_index(drop=True)
+
+streams = sorted(set(zip(stream_df["state"], stream_df["game"])))
+
+# Provide dropdown with State — Game
+options = [f"{s} — {g}" for s, g in streams]
+sel = st.selectbox("Pick a State/Game to rank straights:", options=options, index=0)
+sel_state, sel_game = streams[options.index(sel)]
+
+cols = st.columns(3)
+
+for i, fam in enumerate(["3389", "3889", "3899"]):
+    with cols[i]:
+        st.subheader(f"{fam} — 12 straights")
+        tbl = straight_ranking_for_stream(
+            stream_df,
+            state=sel_state,
+            game=sel_game,
+            family=fam,
+            half_life_days=float(straight_half_life),
+            alpha=float(straight_alpha),
+            recency_mix=float(straight_mix),
+            asof=analysis_end,
+        )
+        # If no local evidence, warn and show what fallback was used
+        evid = str(tbl["Evidence"].iloc[0]) if len(tbl) else ""
+        if evid != "state_game":
+            if evid == "global_fallback":
+                st.warning("No hits for this family in this State/Game within the uploaded window. Using GLOBAL (all uploaded streams) ordering as a fallback.")
+            else:
+                st.warning("No hits for this family found anywhere in the uploaded stream data. Showing an uninformed (uniform) ranking.")
+        st.dataframe(tbl, use_container_width=True, height=480)
+
+# Also allow export of current stream + tables
+st.markdown("---")
+
+# Bundle export: one CSV with all 36 rows for selected stream
+all_rows = []
+for fam in ["3389", "3889", "3899"]:
+    tbl = straight_ranking_for_stream(
+        stream_df,
+        state=sel_state,
+        game=sel_game,
+        family=fam,
+        half_life_days=float(straight_half_life),
+        alpha=float(straight_alpha),
+        recency_mix=float(straight_mix),
+        asof=analysis_end,
+    )
+    tbl.insert(0, "Family", fam)
+    tbl.insert(1, "State", sel_state)
+    tbl.insert(2, "Game", sel_game)
+    all_rows.append(tbl)
+
+bundle = pd.concat(all_rows, ignore_index=True)
+
+st.download_button(
+    "Download straight ranking CSV for selected State/Game",
+    data=bundle.to_csv(index=False).encode("utf-8"),
+    file_name=f"pk4_straight_ranking_{sel_state}_{sel_game}.csv".replace(" ", "_").replace("/", "-"),
     mime="text/csv",
 )
